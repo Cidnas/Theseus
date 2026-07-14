@@ -1,0 +1,7 @@
+[project]
+name = "codeagent"
+version = "0.1.0"
+description = "Core Modules for interacting with codex"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
