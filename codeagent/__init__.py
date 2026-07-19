@@ -8,6 +8,7 @@ from .app_server import (
     CodexTimeoutError,
     final_text,
 )
+from .tool_adapter import register_tools
 
 __all__ = [
     "CodexAppServer",
@@ -16,4 +17,5 @@ __all__ = [
     "CodexServerExited",
     "CodexTimeoutError",
     "final_text",
+    "register_tools",
 ]
