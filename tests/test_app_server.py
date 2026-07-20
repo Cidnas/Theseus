@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -121,6 +122,38 @@ class CodexAppServerTests(unittest.TestCase):
                 client.close()
             payload = json.loads(final_text(raw) or "{}")
             self.assertEqual(payload["threadParams"]["threadId"], thread_id)
+
+    def test_different_agents_can_run_in_parallel_without_mixing_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+
+            async def run_agents() -> tuple[
+                str,
+                str,
+                list[dict[str, object]],
+                list[dict[str, object]],
+            ]:
+                async with self.make_client(project) as client:
+                    thread_a = client.create_agent()
+                    thread_b = client.create_agent()
+                    messages_a, messages_b = await asyncio.gather(
+                        client.run_async("Parallel A", thread_a),
+                        client.run_async("Parallel B", thread_b),
+                    )
+                    return thread_a, thread_b, messages_a, messages_b
+
+            thread_a, thread_b, messages_a, messages_b = asyncio.run(run_agents())
+
+            self.assertEqual(final_text(messages_a), "Parallel A")
+            self.assertEqual(final_text(messages_b), "Parallel B")
+            for thread_id, messages in (
+                (thread_a, messages_a),
+                (thread_b, messages_b),
+            ):
+                for message in messages:
+                    params = message.get("params")
+                    if isinstance(params, dict) and "threadId" in params:
+                        self.assertEqual(params["threadId"], thread_id)
 
     def test_skill_resource_cannot_escape_skill_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

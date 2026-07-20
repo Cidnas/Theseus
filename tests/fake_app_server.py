@@ -5,20 +5,66 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from typing import Any
 
 
 thread_params: dict[str, dict[str, Any]] = {}
+send_lock = threading.Lock()
+parallel_lock = threading.Lock()
+parallel_ready = threading.Event()
+parallel_first_item = threading.Event()
+parallel_second_item = threading.Event()
+parallel_turns = 0
 
 
 def send(message: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    with send_lock:
+        sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
 
 
 def receive() -> dict[str, Any] | None:
     line = sys.stdin.readline()
     return json.loads(line) if line else None
+
+
+def complete_parallel_turn(thread_id: str, turn_id: str, text: str) -> None:
+    parallel_ready.wait()
+    if thread_id == "thread-1":
+        send_agent_message(thread_id, turn_id, text)
+        parallel_first_item.set()
+        parallel_second_item.wait()
+    else:
+        parallel_first_item.wait()
+        send_agent_message(thread_id, turn_id, text)
+        parallel_second_item.set()
+    send(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": thread_id,
+                "turn": {"id": turn_id, "status": "completed"},
+            },
+        }
+    )
+
+
+def send_agent_message(thread_id: str, turn_id: str, text: str) -> None:
+    send(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "item": {
+                    "id": f"item-{thread_id}",
+                    "type": "agentMessage",
+                    "text": text,
+                },
+            },
+        }
+    )
 
 
 while request := receive():
@@ -44,11 +90,25 @@ while request := receive():
         send({"id": request_id, "result": {"thread": {"id": thread_id}}})
     elif method == "turn/start":
         thread_id = params["threadId"]
+        prompt = params.get("input", [{}])[0].get("text", "")
+        if prompt.startswith("Parallel "):
+            turn_id = f"turn-{thread_id}"
+            send({"id": request_id, "result": {"turn": {"id": turn_id}}})
+            with parallel_lock:
+                parallel_turns += 1
+                if parallel_turns == 2:
+                    parallel_ready.set()
+            threading.Thread(
+                target=complete_parallel_turn,
+                args=(thread_id, turn_id, prompt),
+                daemon=True,
+            ).start()
+            continue
+
         turn_id = "turn-1"
         send({"id": request_id, "result": {"turn": {"id": turn_id}}})
         configured = thread_params[thread_id]
         dynamic_tools = configured.get("dynamicTools", [])
-        prompt = params.get("input", [{}])[0].get("text", "")
         if prompt == "Request an unavailable tool.":
             requested_tool = "unavailable"
         elif dynamic_tools:

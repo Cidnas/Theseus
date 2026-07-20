@@ -7,6 +7,7 @@ dynamic tool callbacks remain internal to the module.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -113,10 +114,17 @@ class CodexAppServer:
         self._agents: dict[str, _Agent] = {}
         self._loaded_threads: set[str] = set()
         self._process: subprocess.Popen[str] | None = None
-        self._messages: queue.Queue[JsonObject | BaseException | object] = queue.Queue()
+        self._pending_requests: dict[
+            int, queue.Queue[JsonObject | BaseException | object]
+        ] = {}
+        self._run_inboxes: dict[
+            str, queue.Queue[JsonObject | BaseException | object]
+        ] = {}
+        self._active_threads: set[str] = set()
         self._stderr: deque[str] = deque(maxlen=100)
         self._request_id = 0
-        self._operation_lock = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
+        self._state_lock = threading.RLock()
         self._stdin_lock = threading.Lock()
 
         for skill_file in (self.codex_home / "skills").glob("*/SKILL.md"):
@@ -129,10 +137,17 @@ class CodexAppServer:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    async def __aenter__(self) -> CodexAppServer:
+        await asyncio.to_thread(self.start)
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await asyncio.to_thread(self.close)
+
     def import_auth(self, source_codex_home: str | os.PathLike[str]) -> Path:
         """Copy host credentials into the isolated home as an explicit action."""
 
-        with self._operation_lock:
+        with self._lifecycle_lock:
             if self._process is not None and self._process.poll() is None:
                 raise CodexAppServerError("close app-server before importing authentication")
             source = Path(source_codex_home).expanduser().resolve() / "auth.json"
@@ -161,12 +176,13 @@ class CodexAppServer:
         if not callable(handler):
             raise TypeError("tool handler must be callable")
         schema = validate_json_object(input_schema, label="input_schema")
-        self._tools[name] = _Tool(
-            name=name,
-            description=description.strip(),
-            input_schema=schema,
-            handler=handler,
-        )
+        with self._state_lock:
+            self._tools[name] = _Tool(
+                name=name,
+                description=description.strip(),
+                input_schema=schema,
+                handler=handler,
+            )
 
     def add_skill(
         self,
@@ -199,7 +215,8 @@ class CodexAppServer:
             else:
                 raise TypeError("skill resources must contain str or bytes values")
 
-        self._skills[name] = skill_file
+        with self._state_lock:
+            self._skills[name] = skill_file
         return skill_file
 
     def create_agent(
@@ -215,8 +232,8 @@ class CodexAppServer:
     ) -> str:
         """Create a thread with exactly the requested registered capabilities."""
 
-        with self._operation_lock:
-            self._start_unlocked()
+        self.start()
+        with self._state_lock:
             tool_names = _unique_names(tools, self._tools, "tool")
             skill_names = _unique_names(skills, self._skills, "skill")
             if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
@@ -235,13 +252,14 @@ class CodexAppServer:
             if developer_instructions is not None:
                 params["developerInstructions"] = developer_instructions
 
-            result = self._request_unlocked("thread/start", params)
-            thread_id = _nested_string(result, "thread", "id")
-            if thread_id is None:
-                raise CodexProtocolError("thread/start response did not contain thread.id")
+        result = self._request("thread/start", params)
+        thread_id = _nested_string(result, "thread", "id")
+        if thread_id is None:
+            raise CodexProtocolError("thread/start response did not contain thread.id")
+        with self._state_lock:
             self._agents[thread_id] = _Agent(tool_names, skill_names)
             self._loaded_threads.add(thread_id)
-            return thread_id
+        return thread_id
 
     def run(
         self,
@@ -258,31 +276,45 @@ class CodexAppServer:
             raise ValueError("thread_id cannot be empty")
         operation_timeout = self._timeout if timeout is None else _positive_timeout(timeout)
 
-        with self._operation_lock:
-            self._start_unlocked()
-            agent = self._agents.setdefault(thread_id, _Agent((), ()))
-            if thread_id not in self._loaded_threads:
-                self._request_unlocked(
-                    "thread/resume",
-                    {
-                        "threadId": thread_id,
-                        "dynamicTools": [
-                            self._tools[name].protocol_spec()
-                            for name in agent.tools
-                            if name in self._tools
-                        ],
-                        "config": self._skill_config(agent.skills),
-                    },
+        self.start()
+        with self._state_lock:
+            if thread_id in self._active_threads:
+                raise CodexAppServerError(
+                    f"thread already has an active run: {thread_id}"
                 )
-                self._loaded_threads.add(thread_id)
+            self._active_threads.add(thread_id)
+            agent = self._agents.setdefault(thread_id, _Agent((), ()))
+            should_resume = thread_id not in self._loaded_threads
+            resume_params = {
+                "threadId": thread_id,
+                "dynamicTools": [
+                    self._tools[name].protocol_spec()
+                    for name in agent.tools
+                    if name in self._tools
+                ],
+                "config": self._skill_config(agent.skills),
+            }
+
+        inbox: queue.Queue[JsonObject | BaseException | object] = queue.Queue()
+        try:
+            if should_resume:
+                self._request(
+                    "thread/resume",
+                    resume_params,
+                )
+                with self._state_lock:
+                    self._loaded_threads.add(thread_id)
 
             events: list[JsonObject] = []
-            result = self._request_unlocked(
+            with self._state_lock:
+                self._run_inboxes[thread_id] = inbox
+            result = self._request(
                 "turn/start",
                 {
                     "threadId": thread_id,
                     "input": [{"type": "text", "text": prompt}],
                 },
+                inbox=inbox,
                 events=events,
                 timeout=operation_timeout,
             )
@@ -290,7 +322,7 @@ class CodexAppServer:
             deadline = time.monotonic() + operation_timeout
 
             while True:
-                message = self._next_message(deadline)
+                message = self._next_message(inbox, deadline)
                 events.append(message)
                 if self._is_server_request(message):
                     self._answer_server_request(message)
@@ -303,19 +335,42 @@ class CodexAppServer:
                 completed_turn_id = _nested_string(params, "turn", "id")
                 if turn_id is None or completed_turn_id == turn_id:
                     return events
+        finally:
+            with self._state_lock:
+                if self._run_inboxes.get(thread_id) is inbox:
+                    self._run_inboxes.pop(thread_id, None)
+                self._active_threads.discard(thread_id)
+
+    async def run_async(
+        self,
+        prompt: str,
+        thread_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> list[JsonObject]:
+        """Run one prompt without blocking the caller's asyncio event loop."""
+
+        return await asyncio.to_thread(
+            self.run,
+            prompt,
+            thread_id,
+            timeout=timeout,
+        )
 
     def start(self) -> None:
         """Start app-server and perform the required initialize handshake."""
 
-        with self._operation_lock:
+        with self._lifecycle_lock:
             self._start_unlocked()
 
     def close(self) -> None:
         """Stop the child app-server process."""
 
-        with self._operation_lock:
+        with self._lifecycle_lock:
             process, self._process = self._process, None
-            self._loaded_threads.clear()
+            with self._state_lock:
+                self._loaded_threads.clear()
+            self._fail_waiters(_EOF)
             if process is None:
                 return
             if process.stdin is not None:
@@ -337,10 +392,12 @@ class CodexAppServer:
     def _start_unlocked(self) -> None:
         if self._process is not None and self._process.poll() is None:
             return
+        if self._process is not None:
+            self._fail_waiters(_EOF, process=self._process)
 
-        self._messages = queue.Queue()
         self._stderr.clear()
-        self._loaded_threads.clear()
+        with self._state_lock:
+            self._loaded_threads.clear()
         environment = os.environ.copy()
         environment["CODEX_HOME"] = str(self.codex_home)
         environment["CODEX_SQLITE_HOME"] = str(self.codex_home)
@@ -365,7 +422,7 @@ class CodexAppServer:
         threading.Thread(target=self._read_stdout, args=(process,), daemon=True).start()
         threading.Thread(target=self._read_stderr, args=(process,), daemon=True).start()
         try:
-            self._request_unlocked(
+            self._request(
                 "initialize",
                 {
                     "clientInfo": {
@@ -381,38 +438,53 @@ class CodexAppServer:
             self.close()
             raise
 
-    def _request_unlocked(
+    def _request(
         self,
         method: str,
         params: JsonObject | None = None,
         *,
+        inbox: queue.Queue[JsonObject | BaseException | object] | None = None,
         events: list[JsonObject] | None = None,
         timeout: float | None = None,
     ) -> JsonObject:
-        self._request_id += 1
-        request_id = self._request_id
+        response_inbox = inbox if inbox is not None else queue.Queue()
+        with self._state_lock:
+            self._request_id += 1
+            request_id = self._request_id
+            self._pending_requests[request_id] = response_inbox
         request: JsonObject = {"method": method, "id": request_id}
         if params is not None:
             request["params"] = params
-        self._send(request)
+        try:
+            self._send(request)
+        except BaseException:
+            with self._state_lock:
+                if self._pending_requests.get(request_id) is response_inbox:
+                    self._pending_requests.pop(request_id, None)
+            raise
         deadline = time.monotonic() + (self._timeout if timeout is None else timeout)
 
-        while True:
-            message = self._next_message(deadline)
-            if events is not None:
-                events.append(message)
-            if self._is_server_request(message):
-                self._answer_server_request(message)
-                continue
-            if message.get("id") != request_id:
-                continue
-            error = message.get("error")
-            if error is not None:
-                raise CodexProtocolError(f"{method} failed: {error}")
-            result = message.get("result", {})
-            if not isinstance(result, dict):
-                raise CodexProtocolError(f"{method} returned a non-object result")
-            return result
+        try:
+            while True:
+                message = self._next_message(response_inbox, deadline)
+                if events is not None:
+                    events.append(message)
+                if self._is_server_request(message):
+                    self._answer_server_request(message)
+                    continue
+                if message.get("id") != request_id:
+                    continue
+                error = message.get("error")
+                if error is not None:
+                    raise CodexProtocolError(f"{method} failed: {error}")
+                result = message.get("result", {})
+                if not isinstance(result, dict):
+                    raise CodexProtocolError(f"{method} returned a non-object result")
+                return result
+        finally:
+            with self._state_lock:
+                if self._pending_requests.get(request_id) is response_inbox:
+                    self._pending_requests.pop(request_id, None)
 
     def _answer_server_request(self, message: JsonObject) -> None:
         request_id = message.get("id")
@@ -429,9 +501,14 @@ class CodexAppServer:
 
         tool_name = params.get("tool")
         thread_id = params.get("threadId")
-        agent = self._agents.get(thread_id) if isinstance(thread_id, str) else None
-        allowed = agent is not None and tool_name in agent.tools
-        tool = self._tools.get(tool_name) if isinstance(tool_name, str) and allowed else None
+        with self._state_lock:
+            agent = self._agents.get(thread_id) if isinstance(thread_id, str) else None
+            allowed = agent is not None and tool_name in agent.tools
+            tool = (
+                self._tools.get(tool_name)
+                if isinstance(tool_name, str) and allowed
+                else None
+            )
         if tool is None:
             result = _tool_result(f"unknown or unavailable tool: {tool_name}", success=False)
         else:
@@ -468,12 +545,16 @@ class CodexAppServer:
             except (BrokenPipeError, OSError) as error:
                 raise self._server_exited() from error
 
-    def _next_message(self, deadline: float) -> JsonObject:
+    def _next_message(
+        self,
+        inbox: queue.Queue[JsonObject | BaseException | object],
+        deadline: float,
+    ) -> JsonObject:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise CodexTimeoutError("timed out waiting for app-server")
         try:
-            item = self._messages.get(timeout=remaining)
+            item = inbox.get(timeout=remaining)
         except queue.Empty as error:
             raise CodexTimeoutError("timed out waiting for app-server") from error
         if item is _EOF:
@@ -493,11 +574,62 @@ class CodexAppServer:
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
-                    self._messages.put(CodexProtocolError(f"invalid app-server JSON: {line!r}"))
+                    self._fail_waiters(
+                        CodexProtocolError(f"invalid app-server JSON: {line!r}"),
+                        process=process,
+                    )
                     return
-                self._messages.put(message)
+                if not isinstance(message, dict):
+                    self._fail_waiters(
+                        CodexProtocolError("app-server produced an invalid message"),
+                        process=process,
+                    )
+                    return
+                self._dispatch_message(process, message)
         finally:
-            self._messages.put(_EOF)
+            self._fail_waiters(_EOF, process=process)
+
+    def _dispatch_message(
+        self, process: subprocess.Popen[str], message: JsonObject
+    ) -> None:
+        if self._process is not process:
+            return
+
+        if "id" in message and "method" not in message:
+            with self._state_lock:
+                inbox = self._pending_requests.pop(message.get("id"), None)
+            if inbox is not None:
+                inbox.put(message)
+            return
+
+        thread_id = _message_thread_id(message)
+        with self._state_lock:
+            inbox = self._run_inboxes.get(thread_id) if thread_id is not None else None
+        if inbox is not None:
+            inbox.put(message)
+            return
+
+        if self._is_server_request(message):
+            threading.Thread(
+                target=self._answer_server_request,
+                args=(message,),
+                daemon=True,
+            ).start()
+
+    def _fail_waiters(
+        self,
+        item: BaseException | object,
+        *,
+        process: subprocess.Popen[str] | None = None,
+    ) -> None:
+        if process is not None and self._process is not process:
+            return
+        with self._state_lock:
+            inboxes = list(self._pending_requests.values())
+            inboxes.extend(self._run_inboxes.values())
+            self._pending_requests.clear()
+        for inbox in dict.fromkeys(inboxes):
+            inbox.put(item)
 
     def _read_stderr(self, process: subprocess.Popen[str]) -> None:
         assert process.stderr is not None
@@ -568,6 +700,16 @@ def _nested_string(value: Mapping[str, Any], first: str, second: str) -> str | N
         return None
     result = nested.get(second)
     return result if isinstance(result, str) else None
+
+
+def _message_thread_id(message: Mapping[str, Any]) -> str | None:
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    thread_id = params.get("threadId")
+    if isinstance(thread_id, str):
+        return thread_id
+    return _nested_string(params, "thread", "id")
 
 
 def _tool_result(value: Any, *, success: bool) -> JsonObject:

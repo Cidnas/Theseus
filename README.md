@@ -68,6 +68,31 @@ it starts a new process.
 `turn/completed`. The `final_text()` helper is optional and extracts the last
 completed agent message.
 
+`run()` is synchronous. Use `run_async()` with `asyncio.gather()` to execute
+different agents concurrently:
+
+```python
+import asyncio
+
+async def main():
+    codex = CodexAppServer(".")
+    register_tools(codex, TOOLS)
+
+    async with codex:
+        agent_a = codex.create_agent(tools=["get_item_price"])
+        agent_b = codex.create_agent(tools=["get_item_price"])
+        events_a, events_b = await asyncio.gather(
+            codex.run_async("Price a notebook.", agent_a),
+            codex.run_async("Price a coffee.", agent_b),
+        )
+
+asyncio.run(main())
+```
+
+Internally, one reader routes request responses by request `id` and turn
+messages by `threadId`. A single Codex thread can have only one active run at a
+time.
+
 ## Authentication
 
 The isolated home does not silently reuse host credentials. Authenticate it
