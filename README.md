@@ -1,124 +1,118 @@
 # codeAgent
 
-`codeAgent` is a small Python module for embedding the local Codex app-server in
-another application. Each client owns a project-local `.codex-agent` home, so
-its configuration, sessions, skills, and runtime state stay separate from the
-host machine's normal Codex home.
+`codeAgent` embeds the local Codex app-server in a Python application. It adds
+project-local Codex state, per-thread tools and skills, thread resumption, and
+concurrent runs.
 
-Application tools are ordinary typed Python functions. They do not import
-`codeagent`, construct schemas, or know that Codex will call them:
+## Requirements
+
+- Python 3.12 or newer.
+- The `codex` CLI available on `PATH`.
+- Codex authentication imported from another Codex home or supplied through
+  `CODEX_ACCESS_TOKEN`.
+
+## Quickstart
+
+Tools are ordinary typed Python functions with no dependency on `codeagent`:
 
 ```python
-# my_application/tools/shop.py
+from codeagent import CodexAppServer, final_text, register_tools
+
 
 def get_item_price(item: str) -> float:
     """Return the shop price for an item."""
 
-    prices = {"coffee": 3.50, "notebook": 6.25, "pen": 1.20}
-    return prices[item]
-```
+    return {"coffee": 3.50, "notebook": 6.25}[item]
 
-The application's tools package explicitly collects the functions it wants to
-make available:
-
-```python
-# my_application/tools/__init__.py
-
-from .shop import get_item_price
-
-TOOLS = [get_item_price]
-```
-
-At startup, the generic adapter inspects those functions, generates their JSON
-schemas, adapts app-server argument dictionaries to normal keyword arguments,
-and registers them in the local catalog:
-
-For now, tool parameters must be annotated with `str`, `int`, `float`, or
-`bool`. A docstring supplies the description shown to Codex.
-
-```python
-from codeagent import CodexAppServer, final_text, register_tools
-from my_application.tools import TOOLS
 
 codex = CodexAppServer(".")
-register_tools(codex, TOOLS)
+codex.import_auth("~/.codex")
+tool_names = register_tools(codex, [get_item_price])
 
 with codex:
     thread_id = codex.create_agent(
-        tools=["get_item_price"],
+        tools=tool_names,
         sandbox="read-only",
     )
-    raw_messages = codex.run(
-        "According to the shop tool, how much does a notebook cost?",
-        thread_id,
-    )
-    print(final_text(raw_messages))
+    messages = codex.run("How much is a notebook?", thread_id)
+
+print(final_text(messages))
 ```
 
-Registration only prepares the local catalog; it does not require a running
-thread or send anything to Codex. The `tools` argument to `create_agent()` is a
-separate allowlist. When that thread starts, only the selected registered
-functions are sent as Codex `dynamicTools`.
+`create_agent()` returns a Codex thread ID. Reuse that ID with `run()` to
+continue the conversation. `run()` returns the raw messages collected through
+`turn/completed`; `final_text()` extracts the last completed agent message.
 
-Skills are installed persistently under the isolated Codex home. Dynamic tool
-handlers are Python callables, so the application registers them again whenever
-it starts a new process.
+## Tools and skills
 
-`run()` returns the unmodified JSON messages received for the turn, ending with
-`turn/completed`. The `final_text()` helper is optional and extracts the last
-completed agent message.
+`register_tools()` derives a tool's name, description, and input schema from
+its function name, docstring, and annotations. It only adds the function to an
+in-memory catalog. `create_agent(tools=[...])` selects which registered tools
+Codex can use in that thread.
 
-`run()` is synchronous. Use `run_async()` with `asyncio.gather()` to execute
-different agents concurrently:
+For larger applications, keep tool functions in normal application modules and
+collect the exposed functions in a `TOOLS` list. See
+[`examples/shop_agent`](examples/shop_agent).
+
+`add_skill(name, description, instructions, resources=...)` installs a skill
+under the isolated Codex home. Select installed skills for a thread with
+`create_agent(skills=[...])`. Skills persist on disk; the in-memory tool catalog
+must be rebuilt when the Python application restarts.
+
+## Concurrent runs
+
+`run()` is synchronous. Use `run_async()` with `asyncio.gather()` to run
+different Codex threads concurrently:
 
 ```python
 import asyncio
 
-async def main():
-    codex = CodexAppServer(".")
-    register_tools(codex, TOOLS)
 
+async def run_both(codex: CodexAppServer):
     async with codex:
-        agent_a = codex.create_agent(tools=["get_item_price"])
-        agent_b = codex.create_agent(tools=["get_item_price"])
-        events_a, events_b = await asyncio.gather(
-            codex.run_async("Price a notebook.", agent_a),
-            codex.run_async("Price a coffee.", agent_b),
+        thread_a = codex.create_agent()
+        thread_b = codex.create_agent()
+
+        return await asyncio.gather(
+            codex.run_async("Inspect the API.", thread_a),
+            codex.run_async("Inspect the tests.", thread_b),
         )
-
-asyncio.run(main())
 ```
 
-Internally, one reader routes request responses by request `id` and turn
-messages by `threadId`. A single Codex thread can have only one active run at a
-time.
+`run_async()` moves each blocking `run()` into a worker thread. One app-server
+reader routes request responses by request `id` and turn events by `threadId`,
+so concurrent runs do not consume each other's messages.
 
-## Authentication
+## Authentication and state
 
-The isolated home does not silently reuse host credentials. Authenticate it
-directly by running Codex with `CODEX_HOME` set to `<project>/.codex-agent`, use
-`CODEX_ACCESS_TOKEN`, or explicitly copy an existing login:
+By default, state is stored under `<project>/.codex-agent`, separate from the
+normal Codex home. The directory is ignored by Git because it can contain
+credentials and conversation history.
 
-```python
-codex = CodexAppServer(".")
-codex.import_auth("~/.codex")
-with codex:
-    thread_id = codex.create_agent(sandbox="read-only")
-```
+Authentication is not copied automatically. Call `import_auth()` before
+starting the app-server, as shown above, or set `CODEX_ACCESS_TOKEN` for a
+non-interactive environment.
 
-`.codex-agent/` is ignored by Git because it may contain credentials and session
-history.
+## Current limitations
+
+- Codex app-server is experimental, so its protocol may change.
+- Tool parameters must use `str`, `int`, `float`, or `bool` annotations.
+- Tool functions must be synchronous; `async def` tools are not supported.
+- A Codex thread can have only one active run.
+- Cancelling `run_async()` does not send `turn/interrupt` to Codex.
+- A new `CodexAppServer` object can resume a thread by ID, but it does not
+  automatically recover that thread's tool and skill selections.
 
 ## Tests
 
-The normal suite uses a protocol-level fake server and does not make network or
-model calls:
+The default suite uses a local protocol fake and makes no model calls:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-An opt-in live round-trip test exercises the installed Codex app-server:
+The optional live suite uses local Codex authentication and makes real model
+calls:
 
 ```bash
 CODEAGENT_LIVE_TEST=1 CODEX_AUTH_HOME="$HOME/.codex" \

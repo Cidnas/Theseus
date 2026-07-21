@@ -1,8 +1,8 @@
-"""A small, synchronous client for the Codex app-server protocol.
+"""A small Python client for the Codex app-server protocol.
 
-The public class deliberately exposes only the operations needed to construct
-and run an agent. Transport lifecycle, JSON-RPC routing, streamed events, and
-dynamic tool callbacks remain internal to the module.
+The public class exposes only the operations needed to configure and run Codex
+threads. Transport lifecycle, JSON-RPC routing, streamed events, and dynamic
+tool callbacks remain internal to the module.
 """
 
 from __future__ import annotations
