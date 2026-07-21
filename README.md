@@ -54,6 +54,20 @@ For larger applications, keep tool functions in normal application modules and
 collect the exposed functions in a `TOOLS` list. See
 [`examples/shop_agent`](examples/shop_agent).
 
+## SQLite shop example
+
+[`sample.py`](sample.py) creates a small SQLite shop database, registers six
+focused tools, and asks Codex a question that connects a customer, their latest
+order, its product, and current inventory:
+
+```bash
+python sample.py
+```
+
+The generated database lives at `.sample-data/shop.db`. Schema creation, seed
+data, and query helpers stay under `examples/shop_agent`, keeping the client
+script focused on the public workflow.
+
 `add_skill(name, description, instructions, resources=...)` installs a skill
 under the isolated Codex home. Select installed skills for a thread with
 `create_agent(skills=[...])`. Skills persist on disk; the in-memory tool catalog
@@ -116,5 +130,7 @@ calls:
 
 ```bash
 CODEAGENT_LIVE_TEST=1 CODEX_AUTH_HOME="$HOME/.codex" \
-  python -m unittest tests.test_app_server.LiveCodexAppServerTests -v
+  python -m unittest \
+    tests.test_app_server.LiveCodexAppServerTests \
+    tests.test_shop_agent_live.LiveShopAgentTests -v
 ```
