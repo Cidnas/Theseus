@@ -18,8 +18,11 @@ from examples.learning_agent.build import (
     approve_candidate,
     archive_candidate,
     builder_prompt,
+    builder_repair_prompt,
     next_attempt_number,
+    normalize_candidate,
     parse_builder_response,
+    recover_latest_candidate,
     validate_candidate,
     validate_generated_tools_source,
 )
@@ -126,6 +129,30 @@ def plan_json(graph: dict[str, object]) -> str:
                     "strategy": "Elicit, teach, then retry with a fresh example.",
                     "probes": ["Explain the idea and solve one example."],
                     "completion_criteria": ["Produces a correct explanation and application."],
+                }
+                for index in range(1, 4)
+            ],
+        }
+    )
+
+
+def generated_plan_json(graph: dict[str, object]) -> str:
+    return json.dumps(
+        {
+            "goal_id": graph["goal_concept_id"],
+            "roadmap": "Build the first foundation through explanation and application.",
+            "route": ["concept_0"],
+            "steps": [
+                {
+                    "step_id": f"generated_step_{index}",
+                    "concept_ids": ["concept_0"],
+                    "objective": f"Demonstrate generated objective {index}.",
+                    "mode": "practice",
+                    "strategy": "Elicit an explanation, then ask for an application.",
+                    "probes": ["Explain the concept and apply it to an example."],
+                    "completion_criteria": [
+                        "Produces a correct explanation and application."
+                    ],
                 }
                 for index in range(1, 4)
             ],
@@ -284,6 +311,54 @@ class LearningStoreTests(unittest.TestCase):
             self.assertEqual(current["plan_id"], plan["plan_id"])
             self.assertEqual(current["steps"][0]["status"], "active")
 
+    def test_structured_tutor_turn_persists_evidence_and_checkpoint_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            plan = store.save_learning_plan(plan_json(alternative_graph()), 0)
+            result = store.record_tutor_turn(
+                plan["plan_id"],
+                "step_1",
+                [
+                    {
+                        "concept_id": "weak",
+                        "evidence": "The learner explained the idea.",
+                        "elicitation_context": "An explicit explanation prompt.",
+                    }
+                ],
+                {"status": "completed", "summary": "Criteria appear satisfied."},
+            )
+            self.assertEqual(len(result["evidence_ids"]), 1)
+            self.assertIsNotNone(result["checkpoint_id"])
+            self.assertEqual(
+                store.get_step_evidence(plan["plan_id"], "step_1")[0]["evidence"],
+                "The learner explained the idea.",
+            )
+            self.assertEqual(len(store.pending_checkpoints()), 1)
+
+    def test_structured_tutor_turn_rolls_back_if_evidence_leaves_active_step(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self.make_store(directory)
+            plan = store.save_learning_plan(plan_json(alternative_graph()), 0)
+            with self.assertRaisesRegex(ValueError, "outside the active plan step"):
+                store.record_tutor_turn(
+                    plan["plan_id"],
+                    "step_1",
+                    [
+                        {
+                            "concept_id": "weak",
+                            "evidence": "Valid first record.",
+                            "elicitation_context": "First probe.",
+                        },
+                        {
+                            "concept_id": "route_a",
+                            "evidence": "Invalid second record.",
+                            "elicitation_context": "Second probe.",
+                        },
+                    ],
+                    None,
+                )
+            self.assertEqual(store.get_step_evidence(plan["plan_id"], "step_1"), [])
+
     def test_checkpoint_waits_for_evaluator_and_blocked_allows_early_replan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = self.make_store(directory)
@@ -352,6 +427,45 @@ class GeneratedPackageTests(unittest.TestCase):
             (paths.build_archive / "attempt-01").mkdir(parents=True)
             (paths.build_archive / "attempt-03").mkdir()
             self.assertEqual(next_attempt_number(paths), 4)
+
+    def test_common_mastery_criteria_alias_is_normalized_without_model_retry(self) -> None:
+        candidate = valid_candidate()
+        for concept in candidate["graph"]["concepts"]:
+            criterion = concept.pop("mastery_criteria")[0]
+            concept["measurable_mastery_criteria"] = criterion
+        normalized = normalize_candidate(candidate)
+        validated = validate_candidate(normalized)
+        self.assertTrue(
+            all(
+                isinstance(concept["mastery_criteria"], list)
+                for concept in validated["graph"]["concepts"]
+            )
+        )
+
+    def test_saved_failed_response_can_be_recovered_after_cli_restart(self) -> None:
+        candidate = valid_candidate()
+        for concept in candidate["graph"]["concepts"]:
+            concept["measurable_mastery_criteria"] = concept.pop(
+                "mastery_criteria"
+            )[0]
+        with tempfile.TemporaryDirectory() as directory:
+            paths = TopicPaths(Path(directory), "generated-goal")
+            attempt = paths.build_archive / "attempt-01"
+            attempt.mkdir(parents=True)
+            (attempt / "raw-response.txt").write_text(
+                json.dumps(candidate), encoding="utf-8"
+            )
+            recovered = recover_latest_candidate(paths)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(len(recovered["graph"]["concepts"]), 15)
+
+    def test_repair_prompt_requires_minimal_same_thread_revision(self) -> None:
+        prompt = builder_repair_prompt(
+            "concept x mastery_criteria must be a list"
+        )
+        self.assertIn("do not restart research", prompt)
+        self.assertIn("smallest correction", prompt)
+        self.assertIn("immediately preceding response", prompt)
 
     def test_candidate_contract_and_subprocess_validation(self) -> None:
         candidate = validate_candidate(valid_candidate())
@@ -430,6 +544,90 @@ class GeneratedPackageTests(unittest.TestCase):
                         tool["name"] for tool in payload["threadParams"]["dynamicTools"]
                     )
                     self.assertEqual(actual, expected)
+
+    def test_runtime_replaces_a_saved_role_thread_with_no_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = TopicPaths(root, "generated-goal")
+            candidate = validate_candidate(valid_candidate())
+            attempt = archive_candidate(paths, candidate, 1)
+            approve_candidate(
+                paths,
+                attempt,
+                BuildRequest("Generated goal", "adult beginner", "working knowledge"),
+                "thread-builder",
+            )
+            store = LearningStore(paths.database)
+            missing_thread = "missing-rollout-tutor"
+            store.save_agent_session(
+                "tutor", missing_thread, list(ROLE_TOOLS["tutor"])
+            )
+            progress: list[str] = []
+            client = CodexAppServer(
+                root,
+                server_command=(sys.executable, str(FAKE_SERVER)),
+                timeout=5,
+            )
+            with client:
+                runtime = LearningRuntime(root, paths, client, on_progress=progress.append)
+                runtime.prepare()
+                messages = runtime._run_role("tutor", "Continue the active lesson.")
+
+            replacement = runtime.threads["tutor"]
+            self.assertNotEqual(replacement, missing_thread)
+            self.assertEqual(
+                store.get_agent_sessions()["tutor"]["thread_id"], replacement
+            )
+            self.assertIsNotNone(final_text(messages))
+            self.assertTrue(
+                any("not resumable" in message for message in progress), progress
+            )
+
+    def test_runtime_migrates_legacy_tutor_and_uses_one_structured_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = TopicPaths(root, "generated-goal")
+            graph = generated_graph()
+            candidate = validate_candidate(valid_candidate())
+            attempt = archive_candidate(paths, candidate, 1)
+            approve_candidate(
+                paths,
+                attempt,
+                BuildRequest("Generated goal", "adult beginner", "working knowledge"),
+                "thread-builder",
+            )
+            store = LearningStore(paths.database)
+            store.save_learning_plan(generated_plan_json(graph), 0)
+            legacy_thread = "legacy-tutor-thread"
+            store.save_agent_session(
+                "tutor",
+                legacy_thread,
+                [
+                    "get_knowledge_graph",
+                    "get_learner_model",
+                    "submit_mastery_evidence",
+                    "get_learning_plan",
+                    "signal_plan_checkpoint",
+                ],
+            )
+            progress: list[str] = []
+            client = CodexAppServer(
+                root,
+                server_command=(sys.executable, str(FAKE_SERVER)),
+                timeout=5,
+            )
+            with client:
+                runtime = LearningRuntime(root, paths, client, on_progress=progress.append)
+                answer = runtime.tutor_turn("A relevant learner answer.")
+
+            self.assertEqual(answer, "Fast structured tutor reply.")
+            self.assertNotEqual(runtime.threads["tutor"], legacy_thread)
+            saved = store.get_agent_sessions()["tutor"]
+            self.assertEqual(saved["tools"], [])
+            evidence = store.get_step_evidence(1, "generated_step_1")
+            self.assertEqual(len(evidence), 1)
+            self.assertEqual(evidence[0]["concept_id"], "concept_0")
+            self.assertTrue(any("fast turn protocol" in item for item in progress))
 
 
 class CliDebugTests(unittest.TestCase):
@@ -519,6 +717,7 @@ class LiveLearningAgentTests(unittest.TestCase):
                 feedback = None
                 candidate = None
                 builder_errors: list[str] = []
+                prompt = builder_prompt(request)
                 for attempt_number in range(1, 4):
                     print(
                         f"[live 2/7] Researching and generating graph "
@@ -527,7 +726,7 @@ class LiveLearningAgentTests(unittest.TestCase):
                     )
                     response = final_text(
                         client.run(
-                            builder_prompt(request, feedback),
+                            prompt,
                             builder_thread,
                             timeout=600,
                         )
@@ -541,6 +740,7 @@ class LiveLearningAgentTests(unittest.TestCase):
                         builder_errors.append(f"attempt {attempt_number}: {error}")
                         print(f"[live] Builder validation failed: {error}", flush=True)
                         feedback = f"Validation failed: {error}. Return a corrected artifact."
+                        prompt = builder_repair_prompt(feedback)
                 self.assertIsNotNone(
                     candidate,
                     "real builder did not produce a valid package: "

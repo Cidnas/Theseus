@@ -67,7 +67,8 @@ def validate_graph(
             raise GraphValidationError(f"concept {concept_id} has invalid kind")
         if not _string_list(criteria):
             raise GraphValidationError(
-                f"concept {concept_id} needs measurable mastery criteria"
+                f"concept {concept_id} needs measurable mastery criteria: "
+                "mastery_criteria must be a non-empty JSON array of strings"
             )
         if not _string_list(components, allow_empty=True):
             raise GraphValidationError(f"concept {concept_id} has invalid components")

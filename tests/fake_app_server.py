@@ -86,8 +86,19 @@ while request := receive():
         send({"method": "thread/started", "params": {"thread": {"id": thread_id}}})
     elif method == "thread/resume":
         thread_id = params["threadId"]
-        thread_params[thread_id] = params
-        send({"id": request_id, "result": {"thread": {"id": thread_id}}})
+        if thread_id.startswith("missing-rollout-"):
+            send(
+                {
+                    "id": request_id,
+                    "error": {
+                        "code": -32600,
+                        "message": f"no rollout found for thread id {thread_id}",
+                    },
+                }
+            )
+        else:
+            thread_params[thread_id] = params
+            send({"id": request_id, "result": {"thread": {"id": thread_id}}})
     elif method == "turn/start":
         thread_id = params["threadId"]
         prompt = params.get("input", [{}])[0].get("text", "")
@@ -135,8 +146,29 @@ while request := receive():
         payload = {
             "codexHome": os.environ.get("CODEX_HOME"),
             "threadParams": configured,
+            "turnParams": params,
             "toolResponse": tool_response,
         }
+        application_context = params.get("additionalContext", {})
+        active_step = application_context.get("active_learning_step")
+        if isinstance(active_step, dict):
+            context = json.loads(active_step["value"])
+            response_text = json.dumps(
+                {
+                    "reply": "Fast structured tutor reply.",
+                    "evidence": [
+                        {
+                            "concept_id": context["step"]["concept_ids"][0],
+                            "evidence": "The learner supplied a relevant answer.",
+                            "elicitation_context": "The active-step practice prompt.",
+                        }
+                    ],
+                    "checkpoint": None,
+                },
+                sort_keys=True,
+            )
+        else:
+            response_text = json.dumps(payload, sort_keys=True)
         send(
             {
                 "method": "item/completed",
@@ -146,7 +178,7 @@ while request := receive():
                     "item": {
                         "id": "item-1",
                         "type": "agentMessage",
-                        "text": json.dumps(payload, sort_keys=True),
+                        "text": response_text,
                     },
                 },
             }

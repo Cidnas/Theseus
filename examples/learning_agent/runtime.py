@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from codeagent import CodexAppServer, final_text, register_tools
+from codeagent import CodexAppServer, CodexProtocolError, final_text, register_tools
 
 from .build import TopicPaths, load_generated_tools
 from .database import LearningStore
-from .tools import EVALUATOR_TOOLS, PLANNER_TOOLS, TUTOR_TOOLS
+from .tools import EVALUATOR_TOOLS, PLANNER_TOOLS, TOOL_NAMES, TUTOR_TOOLS
 
 
 ROLE_TOOLS = {
@@ -23,21 +23,27 @@ ROLE_TOOLS = {
 ROLE_INSTRUCTIONS = {
     "tutor": """
 You are the learner-facing tutor. The learner sees only your final conversational
-reply, never internal state or other agents. At the start of every turn, inspect
-the current learning plan and learner model. Work only on the active step and its
-available prerequisite frontier.
+reply, never internal state or other agents. The host supplies the current active
+learning step as trusted application context on every turn. Use that compact
+context and the conversation itself; do not research, inspect files, or seek the
+full graph, plan, or learner model.
 
-Teach naturally and ask useful questions. A step may take unlimited conversational
-turns. Record concrete signals with submit_mastery_evidence, linked only to the
+Teach naturally, adapt to the learner's latest response, and ask useful questions.
+A step may take unlimited conversational turns. Return the learner-facing reply
+plus zero or more evidence records using the required output schema. Record only
+criterion-relevant signals from the learner's latest message, linked to the
 concept actually evidenced. Evidence must quote or precisely summarize what the
-learner did; do not grade it and never modify mastery probabilities. Self-reports
-are evidence but are not direct demonstrations.
+learner did; do not grade it. A candid inability to answer may be diagnostically
+useful, but routine acknowledgments and conversational filler are not evidence.
 
-Signal a completed checkpoint only when the active step's completion criteria
-appear met and enough useful evidence has been gathered. Signal blocked only when
-the route is unsuitable or the learner cannot progress, not merely because more
-teaching is needed. The host, evaluator, and evidence gate decide transitions.
-Do not mention tools, agents, probabilities, hidden plans, or evidence machinery.
+Return a completed checkpoint only when the active step's observable completion
+criteria and evidence requirements appear met across the conversation. Return a
+blocked checkpoint only when the route is genuinely unsuitable or the learner
+cannot progress, not merely because more teaching is needed. Do not begin a new
+step in the same turn; the host will supply it on the next turn after validation.
+The host and evaluator own persistence, grading, probabilities, and transitions.
+Never mention schemas, agents, probabilities, hidden plans, or evidence machinery
+in the learner-facing reply.
 """,
     "evaluator": """
 You are a strict evidence evaluator, not a tutor or planner. Use
@@ -108,7 +114,7 @@ class LearningRuntime:
             return
         self._report("Validating the approved topic and registering its tools")
         tool_names = register_tools(self.codex, load_generated_tools(self.topic))
-        if set(tool_names) != set().union(*map(set, ROLE_TOOLS.values())):
+        if set(tool_names) != set(TOOL_NAMES):
             raise RuntimeError("generated topic did not register the eight-tool contract")
         sessions = self.store.get_agent_sessions()
         self._report("Restoring persisted builder, tutor, evaluator, and planner threads")
@@ -122,18 +128,16 @@ class LearningRuntime:
             saved = sessions.get(role)
             if saved:
                 if tuple(saved["tools"]) != tuple(selected):
-                    raise RuntimeError(f"persisted {role} capability set is invalid")
-                thread_id = self.codex.resume_agent(
-                    saved["thread_id"], tools=selected, skills=saved["skills"]
-                )
+                    if role != "tutor":
+                        raise RuntimeError(f"persisted {role} capability set is invalid")
+                    self._report("Upgrading the saved tutor to the fast turn protocol")
+                    thread_id = self._create_role_agent(role)
+                else:
+                    thread_id = self.codex.resume_agent(
+                        saved["thread_id"], tools=selected, skills=saved["skills"]
+                    )
             else:
-                thread_id = self.codex.create_agent(
-                    tools=selected,
-                    sandbox="read-only",
-                    approval_policy="never",
-                    developer_instructions=ROLE_INSTRUCTIONS[role].strip(),
-                )
-                self.store.save_agent_session(role, thread_id, list(selected))
+                thread_id = self._create_role_agent(role)
             self.threads[role] = thread_id
         self._registered = True
         self._report("All agent threads are ready")
@@ -160,16 +164,28 @@ class LearningRuntime:
         plan = self.ensure_active_plan()
         active = next(step for step in plan["steps"] if step["status"] == "active")
         self._report(f"Tutor model is working on step {active['step_id']}")
-        messages = self.codex.run(
+        messages = self._run_role(
+            "tutor",
             learner_message,
-            self.threads["tutor"],
-            on_event=self._event_handler("tutor"),
+            output_schema=_tutor_turn_schema(active["concept_ids"]),
+            additional_context={
+                "active_learning_step": self._tutor_context(plan, active)
+            },
         )
-        answer = final_text(messages)
-        if answer is None:
-            raise RuntimeError("tutor completed without a learner-facing response")
+        turn = _parse_tutor_turn(messages)
+        persisted = self.store.record_tutor_turn(
+            plan["plan_id"],
+            active["step_id"],
+            turn["evidence"],
+            turn["checkpoint"],
+        )
+        evidence_count = len(persisted["evidence_ids"])
+        if evidence_count:
+            self._report(f"Recorded {evidence_count} learner evidence signal(s)")
+        if persisted["checkpoint_id"] is not None:
+            self._report(f"Tutor requested a checkpoint for step {active['step_id']}")
         self.process_checkpoints()
-        return answer
+        return turn["reply"]
 
     def process_checkpoints(self) -> list[dict[str, Any]]:
         """Evaluate checkpoint evidence and replan only at allowed boundaries."""
@@ -209,11 +225,7 @@ class LearningRuntime:
             "Call the assessment tool once for every record, including records "
             "that are uninformative. Do not stop while any record remains pending."
         )
-        self.codex.run(
-            prompt,
-            self.threads["evaluator"],
-            on_event=self._event_handler("evaluator"),
-        )
+        self._run_role("evaluator", prompt)
         remaining = self.store.list_pending_mastery_evidence()
         if remaining:
             raise RuntimeError(
@@ -233,11 +245,7 @@ class LearningRuntime:
             f"{reason} Current learner state_revision is {revision}. Inspect all "
             "available state with your tools, then persist the new plan."
         )
-        self.codex.run(
-            prompt,
-            self.threads["planner"],
-            on_event=self._event_handler("planner"),
-        )
+        self._run_role("planner", prompt)
         plan = self.store.get_learning_plan()
         if (
             plan is None
@@ -248,6 +256,78 @@ class LearningRuntime:
             raise RuntimeError("planner did not persist a fresh plan")
         self._report_active_step(plan)
         return plan
+
+    def _create_role_agent(self, role: str) -> str:
+        selected = ROLE_TOOLS[role]
+        thread_id = self.codex.create_agent(
+            tools=selected,
+            sandbox="read-only",
+            approval_policy="never",
+            developer_instructions=ROLE_INSTRUCTIONS[role].strip(),
+        )
+        self.store.save_agent_session(role, thread_id, list(selected))
+        self.threads[role] = thread_id
+        return thread_id
+
+    def _run_role(
+        self,
+        role: str,
+        prompt: str,
+        *,
+        output_schema: Mapping[str, Any] | None = None,
+        additional_context: Mapping[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            return self.codex.run(
+                prompt,
+                self.threads[role],
+                on_event=self._event_handler(role),
+                output_schema=output_schema,
+                additional_context=additional_context,
+            )
+        except CodexProtocolError as error:
+            if "no rollout found for thread id" not in str(error).lower():
+                raise
+            old_thread_id = self.threads[role]
+            self._report(
+                f"Saved {role} thread is not resumable; creating a replacement"
+            )
+            new_thread_id = self._create_role_agent(role)
+            self._report(
+                f"Replaced {role} thread {old_thread_id} with {new_thread_id}"
+            )
+            return self.codex.run(
+                prompt,
+                new_thread_id,
+                on_event=self._event_handler(role),
+                output_schema=output_schema,
+                additional_context=additional_context,
+            )
+
+    def _tutor_context(
+        self, plan: dict[str, Any], active: dict[str, Any]
+    ) -> str:
+        step = {
+            key: active[key]
+            for key in (
+                "step_id",
+                "concept_ids",
+                "objective",
+                "mode",
+                "strategy",
+                "probes",
+                "completion_criteria",
+                "evidence_requirements",
+            )
+        }
+        context = {
+            "plan_id": plan["plan_id"],
+            "step": step,
+            "prior_evidence": self.store.get_step_evidence(
+                plan["plan_id"], active["step_id"]
+            ),
+        }
+        return json.dumps(context, separators=(",", ":"), ensure_ascii=False)
 
     def _report_active_step(self, plan: dict[str, Any]) -> None:
         active = next(
@@ -271,6 +351,73 @@ class LearningRuntime:
         if self.on_model_event is None:
             return None
         return lambda event: self.on_model_event(role, event)
+
+
+def _tutor_turn_schema(concept_ids: list[str]) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "reply": {"type": "string", "minLength": 1},
+            "evidence": {
+                "type": "array",
+                "maxItems": 6,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "concept_id": {"type": "string", "enum": concept_ids},
+                        "evidence": {"type": "string", "minLength": 1},
+                        "elicitation_context": {"type": "string", "minLength": 1},
+                    },
+                    "required": [
+                        "concept_id",
+                        "evidence",
+                        "elicitation_context",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "checkpoint": {
+                "anyOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "properties": {
+                            "status": {
+                                "type": "string",
+                                "enum": ["completed", "blocked"],
+                            },
+                            "summary": {"type": "string", "minLength": 1},
+                        },
+                        "required": ["status", "summary"],
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+        },
+        "required": ["reply", "evidence", "checkpoint"],
+        "additionalProperties": False,
+    }
+
+
+def _parse_tutor_turn(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    raw = final_text(messages)
+    if raw is None:
+        raise RuntimeError("tutor completed without a structured response")
+    try:
+        turn = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("tutor returned invalid structured JSON") from error
+    if not isinstance(turn, dict) or set(turn) != {"reply", "evidence", "checkpoint"}:
+        raise RuntimeError("tutor structured response has an invalid shape")
+    if not isinstance(turn["reply"], str) or not turn["reply"].strip():
+        raise RuntimeError("tutor completed without a learner-facing reply")
+    if not isinstance(turn["evidence"], list) or len(turn["evidence"]) > 6:
+        raise RuntimeError("tutor structured response has invalid evidence")
+    checkpoint = turn["checkpoint"]
+    if checkpoint is not None and not isinstance(checkpoint, dict):
+        raise RuntimeError("tutor structured response has an invalid checkpoint")
+    turn["reply"] = turn["reply"].strip()
+    return turn
 
 
 def plan_as_pretty_json(plan: dict[str, Any]) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import hashlib
 import importlib.util
 import json
@@ -117,8 +118,11 @@ Requirements:
 - graph: schema_version 1, goal object (title, audience, depth),
   goal_concept_id, and 15-40 concepts.
 - Every concept has id (lower_snake_case), title, description, kind
-  (atomic or chunk), measurable mastery_criteria, components, and
+  (atomic or chunk), mastery_criteria, components, and
   prerequisite_groups.
+- mastery_criteria must be a non-empty JSON array of strings, for example:
+  "mastery_criteria": ["Correctly classify five of six examples and explain why."]
+  Never use a field named measurable_mastery_criteria.
 - components are all required and express component_of relationships. An atomic
   concept has none; a chunk has at least one.
 - prerequisite_groups is an OR-of-ANDs: each inner list is a complete route, and
@@ -128,6 +132,30 @@ Requirements:
 - tools_py must be EXACTLY this Python source, encoded as a JSON string:
 
 {GENERATED_TOOLS_SOURCE}
+""".strip()
+
+
+def builder_repair_prompt(
+    validation_error: str, *, previous_artifact: dict[str, Any] | None = None
+) -> str:
+    """Ask the same builder thread for a minimal repair, not fresh research."""
+
+    artifact = (
+        "\nThe prior artifact is included because this is a resumed CLI process:\n"
+        + json.dumps(previous_artifact, ensure_ascii=False)
+        if previous_artifact is not None
+        else "\nUse the complete artifact from your immediately preceding response."
+    )
+    return f"""
+Revise the previous JSON artifact; do not restart research or redesign the graph.
+Preserve every valid source, research conclusion, concept, edge, and identifier.
+Apply the smallest correction that fixes this validation failure, then check every
+concept for the same schema mistake. Return the complete corrected JSON object and
+nothing else.
+
+VALIDATION FAILURE:
+{validation_error}
+{artifact}
 """.strip()
 
 
@@ -153,6 +181,7 @@ def parse_builder_response(text: str) -> dict[str, Any]:
 def validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     """Validate research depth, sources, graph shape, and generated code."""
 
+    candidate = normalize_candidate(candidate)
     research = candidate.get("research_markdown")
     sources = candidate.get("sources")
     tools_source = candidate.get("tools_py")
@@ -176,6 +205,43 @@ def validate_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "graph": graph,
         "tools_py": tools_source,
     }
+
+
+def normalize_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Canonically repair unambiguous, representation-only model mistakes."""
+
+    normalized = copy.deepcopy(candidate)
+    graph = normalized.get("graph")
+    if not isinstance(graph, dict) or not isinstance(graph.get("concepts"), list):
+        return normalized
+    for concept in graph["concepts"]:
+        if not isinstance(concept, dict):
+            continue
+        criteria = concept.get("mastery_criteria")
+        if criteria is None and "measurable_mastery_criteria" in concept:
+            criteria = concept.pop("measurable_mastery_criteria")
+        if isinstance(criteria, str) and criteria.strip():
+            concept["mastery_criteria"] = [criteria.strip()]
+    return normalized
+
+
+def recover_latest_candidate(paths: TopicPaths) -> dict[str, Any] | None:
+    """Revalidate saved raw output so a restarted CLI can avoid new research."""
+
+    if not paths.build_archive.is_dir():
+        return None
+    attempts = sorted(paths.build_archive.glob("attempt-*"), reverse=True)
+    for attempt in attempts:
+        raw_path = attempt / "raw-response.txt"
+        if not raw_path.is_file():
+            continue
+        try:
+            return validate_candidate(
+                parse_builder_response(raw_path.read_text(encoding="utf-8"))
+            )
+        except (ValueError, GraphValidationError):
+            continue
+    return None
 
 
 def validate_generated_tools_source(source: Any) -> None:

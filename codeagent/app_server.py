@@ -297,6 +297,8 @@ class CodexAppServer:
         *,
         timeout: float | None = None,
         on_event: EventHandler | None = None,
+        output_schema: Mapping[str, Any] | None = None,
+        additional_context: Mapping[str, str] | None = None,
     ) -> list[JsonObject]:
         """Run one prompt and return every raw app-server message for the turn."""
 
@@ -305,6 +307,24 @@ class CodexAppServer:
         if not thread_id.strip():
             raise ValueError("thread_id cannot be empty")
         operation_timeout = self._timeout if timeout is None else _positive_timeout(timeout)
+        turn_params: JsonObject = {
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+        }
+        if output_schema is not None:
+            turn_params["outputSchema"] = validate_json_object(
+                output_schema, label="output_schema"
+            )
+        if additional_context is not None:
+            context: JsonObject = {}
+            for source, value in additional_context.items():
+                if not isinstance(source, str) or not source.strip():
+                    raise ValueError("additional_context keys must be non-empty strings")
+                if not isinstance(value, str):
+                    raise TypeError("additional_context values must be strings")
+                context[source] = {"kind": "application", "value": value}
+            if context:
+                turn_params["additionalContext"] = context
 
         self.start()
         with self._state_lock:
@@ -340,10 +360,7 @@ class CodexAppServer:
                 self._run_inboxes[thread_id] = inbox
             result = self._request(
                 "turn/start",
-                {
-                    "threadId": thread_id,
-                    "input": [{"type": "text", "text": prompt}],
-                },
+                turn_params,
                 inbox=inbox,
                 events=events,
                 timeout=operation_timeout,
@@ -381,6 +398,8 @@ class CodexAppServer:
         *,
         timeout: float | None = None,
         on_event: EventHandler | None = None,
+        output_schema: Mapping[str, Any] | None = None,
+        additional_context: Mapping[str, str] | None = None,
     ) -> list[JsonObject]:
         """Run one prompt without blocking the caller's asyncio event loop."""
 
@@ -390,6 +409,8 @@ class CodexAppServer:
                 thread_id,
                 timeout=timeout,
                 on_event=on_event,
+                output_schema=output_schema,
+                additional_context=additional_context,
             )
         )
         assert isinstance(result, list)

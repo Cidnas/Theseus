@@ -86,6 +86,42 @@ class CodexAppServerTests(unittest.TestCase):
             self.assertEqual(payload["threadParams"]["threadId"], "existing-thread")
             self.assertEqual(payload["threadParams"]["dynamicTools"], [])
 
+    def test_run_passes_structured_output_and_application_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            schema = {
+                "type": "object",
+                "properties": {"reply": {"type": "string"}},
+                "required": ["reply"],
+                "additionalProperties": False,
+            }
+            with self.make_client(project) as client:
+                thread_id = client.create_agent()
+                raw = client.run(
+                    "Use the supplied context.",
+                    thread_id,
+                    output_schema=schema,
+                    additional_context={"active_step": "Step context"},
+                )
+
+            turn = json.loads(final_text(raw) or "{}")["turnParams"]
+            self.assertEqual(turn["outputSchema"], schema)
+            self.assertEqual(
+                turn["additionalContext"],
+                {"active_step": {"kind": "application", "value": "Step context"}},
+            )
+
+    def test_run_rejects_invalid_application_context_before_starting_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.make_client(Path(directory)) as client:
+                thread_id = client.create_agent()
+                with self.assertRaisesRegex(ValueError, "non-empty strings"):
+                    client.run("Prompt", thread_id, additional_context={"": "value"})
+                with self.assertRaisesRegex(TypeError, "values must be strings"):
+                    client.run(  # type: ignore[arg-type]
+                        "Prompt", thread_id, additional_context={"source": 3}
+                    )
+
     def test_registered_tool_is_rejected_when_not_attached_to_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -243,6 +279,98 @@ class LiveCodexAppServerTests(unittest.TestCase):
                 "CODEAGENT_OK",
                 msg=json.dumps(raw, indent=2, sort_keys=True),
             )
+
+    def test_real_structured_tutor_turn_with_application_context(self) -> None:
+        source_home = os.environ.get("CODEX_AUTH_HOME")
+        if not source_home:
+            self.skipTest("CODEX_AUTH_HOME is not set")
+        schema = {
+            "type": "object",
+            "properties": {
+                "reply": {"type": "string", "minLength": 1},
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "concept_id": {
+                                "type": "string",
+                                "enum": ["quantitative_variables"],
+                            },
+                            "evidence": {"type": "string", "minLength": 1},
+                            "elicitation_context": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                        },
+                        "required": [
+                            "concept_id",
+                            "evidence",
+                            "elicitation_context",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+                "checkpoint": {
+                    "anyOf": [
+                        {"type": "null"},
+                        {
+                            "type": "object",
+                            "properties": {
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["completed", "blocked"],
+                                },
+                                "summary": {"type": "string"},
+                            },
+                            "required": ["status", "summary"],
+                            "additionalProperties": False,
+                        },
+                    ]
+                },
+            },
+            "required": ["reply", "evidence", "checkpoint"],
+            "additionalProperties": False,
+        }
+        context = json.dumps(
+            {
+                "step": {
+                    "concept_ids": ["quantitative_variables"],
+                    "objective": "Classify measured quantities and numerical labels.",
+                    "completion_criteria": [
+                        "Correctly classify several cases and justify the distinction."
+                    ],
+                },
+                "prior_evidence": [],
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            client = CodexAppServer(project, timeout=180)
+            client.import_auth(source_home)
+            with client:
+                thread_id = client.create_agent(
+                    sandbox="read-only",
+                    developer_instructions=(
+                        "You are a concise tutor. Use the trusted active-step context. "
+                        "Record criterion-relevant evidence in the structured response."
+                    ),
+                )
+                raw = client.run(
+                    'The learner says: "Height in centimeters is a measured amount." '
+                    "Respond naturally, record one evidence item, and do not checkpoint.",
+                    thread_id,
+                    output_schema=schema,
+                    additional_context={"active_learning_step": context},
+                )
+
+        result = json.loads(final_text(raw) or "{}")
+        self.assertTrue(result["reply"].strip())
+        self.assertEqual(len(result["evidence"]), 1)
+        self.assertEqual(
+            result["evidence"][0]["concept_id"], "quantitative_variables"
+        )
+        self.assertIsNone(result["checkpoint"])
 
     def test_real_custom_skill_and_tool(self) -> None:
         source_home = os.environ.get("CODEX_AUTH_HOME")

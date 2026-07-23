@@ -20,13 +20,7 @@ TOOL_NAMES = (
     "signal_plan_checkpoint",
 )
 
-TUTOR_TOOLS = (
-    "get_knowledge_graph",
-    "get_learner_model",
-    "submit_mastery_evidence",
-    "get_learning_plan",
-    "signal_plan_checkpoint",
-)
+TUTOR_TOOLS: tuple[str, ...] = ()
 EVALUATOR_TOOLS = (
     "get_knowledge_graph",
     "get_learner_model",

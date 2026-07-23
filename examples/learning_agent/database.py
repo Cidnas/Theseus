@@ -349,6 +349,126 @@ class LearningStore:
             )
         return {"checkpoint_id": cursor.lastrowid, "status": "pending_evaluation"}
 
+    def record_tutor_turn(
+        self,
+        plan_id: int,
+        step_id: str,
+        evidence: list[dict[str, str]],
+        checkpoint: dict[str, str] | None,
+    ) -> dict[str, Any]:
+        """Atomically persist one structured tutor turn against the active step."""
+
+        normalized_evidence: list[dict[str, str]] = []
+        for item in evidence:
+            if not isinstance(item, dict) or set(item) != {
+                "concept_id",
+                "evidence",
+                "elicitation_context",
+            }:
+                raise ValueError("tutor evidence has an invalid shape")
+            if not all(isinstance(value, str) and value.strip() for value in item.values()):
+                raise ValueError("tutor evidence fields must be non-empty strings")
+            normalized_evidence.append(
+                {key: value.strip() for key, value in item.items()}
+            )
+
+        normalized_checkpoint: dict[str, str] | None = None
+        if checkpoint is not None:
+            if not isinstance(checkpoint, dict) or set(checkpoint) != {"status", "summary"}:
+                raise ValueError("tutor checkpoint has an invalid shape")
+            status = checkpoint.get("status")
+            summary = checkpoint.get("summary")
+            if not isinstance(status, str) or status not in {"completed", "blocked"}:
+                raise ValueError("checkpoint status must be completed or blocked")
+            if not isinstance(summary, str) or not summary.strip():
+                raise ValueError("checkpoint summary cannot be empty")
+            normalized_checkpoint = {"status": status, "summary": summary.strip()}
+
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown plan: {plan_id}")
+            if row["status"] != "active":
+                raise ValueError("tutor turn plan is not active")
+            plan = json.loads(row["plan_json"])
+            step = next(
+                (item for item in plan["steps"] if item["step_id"] == step_id), None
+            )
+            if step is None or step["status"] != "active":
+                raise ValueError("tutor turn step is not the active step")
+
+            allowed_concepts = set(step["concept_ids"])
+            created_at = _now()
+            evidence_ids: list[int] = []
+            for item in normalized_evidence:
+                if item["concept_id"] not in allowed_concepts:
+                    raise ValueError(
+                        "tutor evidence concept is outside the active plan step"
+                    )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO evidence(
+                        concept_id, evidence, elicitation_context, plan_id, step_id,
+                        status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        item["concept_id"],
+                        item["evidence"],
+                        item["elicitation_context"],
+                        plan_id,
+                        step_id,
+                        created_at,
+                    ),
+                )
+                evidence_ids.append(int(cursor.lastrowid))
+
+            checkpoint_id: int | None = None
+            if normalized_checkpoint is not None:
+                pending = connection.execute(
+                    "SELECT id FROM checkpoints WHERE plan_id = ? AND status = 'pending'",
+                    (plan_id,),
+                ).fetchone()
+                if pending is not None:
+                    raise ValueError("this plan already has a pending checkpoint")
+                cursor = connection.execute(
+                    """
+                    INSERT INTO checkpoints(
+                        plan_id, step_id, requested_status, summary, status, created_at
+                    ) VALUES (?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        plan_id,
+                        step_id,
+                        normalized_checkpoint["status"],
+                        normalized_checkpoint["summary"],
+                        created_at,
+                    ),
+                )
+                checkpoint_id = int(cursor.lastrowid)
+
+        return {"evidence_ids": evidence_ids, "checkpoint_id": checkpoint_id}
+
+    def get_step_evidence(
+        self, plan_id: int, step_id: str, *, limit: int = 12
+    ) -> list[dict[str, Any]]:
+        """Return compact recent evidence for host-provided tutor context."""
+
+        if limit <= 0:
+            raise ValueError("evidence limit must be positive")
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT id, concept_id, evidence, status, judgment, quality, rationale
+                FROM evidence WHERE plan_id = ? AND step_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (plan_id, step_id, limit),
+            ).fetchall()
+        return [dict(row) for row in reversed(rows)]
+
     def pending_checkpoints(self) -> list[dict[str, Any]]:
         """Return host work items; this operation is intentionally not an agent tool."""
 

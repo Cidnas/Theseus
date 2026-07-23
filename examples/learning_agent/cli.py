@@ -16,9 +16,11 @@ from .build import (
     approve_candidate,
     archive_candidate,
     builder_prompt,
+    builder_repair_prompt,
     load_topic,
     next_attempt_number,
     parse_builder_response,
+    recover_latest_candidate,
     slugify,
     validate_candidate,
 )
@@ -78,41 +80,54 @@ def _build(arguments: argparse.Namespace) -> int:
                 "pretend that a source supports a relationship it does not support."
             ),
         )
-        feedback: str | None = None
         attempt = next_attempt_number(paths) - 1
         attempts_this_run = 0
+        prompt = builder_prompt(request)
+        recovered_candidate = recover_latest_candidate(paths)
         while True:
             attempt += 1
-            attempts_this_run += 1
-            debug.phase(
-                f"Build phase 1/5: researching the graph (attempt {attempt})"
-            )
-            messages = codex.run(
-                builder_prompt(request, feedback),
-                thread_id,
-                timeout=arguments.timeout,
-                on_event=(
-                    (lambda event: debug.model_event("builder", event))
-                    if arguments.debug
-                    else None
-                ),
-            )
-            raw = final_text(messages) or ""
-            try:
+            candidate_known_to_thread = False
+            if recovered_candidate is not None:
                 debug.phase(
-                    f"Build phase 2/5: validating graph and code (attempt {attempt})"
+                    f"Build phase 2/5: recovering saved candidate as attempt {attempt}"
                 )
-                candidate = validate_candidate(parse_builder_response(raw))
+                candidate = recovered_candidate
+                recovered_candidate = None
                 attempt_dir = archive_candidate(paths, candidate, attempt)
-            except Exception as error:
-                _archive_invalid(paths, attempt, raw, error)
-                debug.note(f"Validation failed: {error}")
-                if attempts_this_run >= 3:
-                    raise RuntimeError(
-                        f"builder failed validation three times; inspect {paths.build_archive}"
-                    ) from error
-                feedback = f"Automated validation failed: {error}. Correct every issue."
-                continue
+                debug.note("Recovered the prior response without repeating research")
+            else:
+                attempts_this_run += 1
+                candidate_known_to_thread = True
+                debug.phase(
+                    f"Build phase 1/5: researching or repairing graph (attempt {attempt})"
+                )
+                messages = codex.run(
+                    prompt,
+                    thread_id,
+                    timeout=arguments.timeout,
+                    on_event=(
+                        (lambda event: debug.model_event("builder", event))
+                        if arguments.debug
+                        else None
+                    ),
+                )
+                raw = final_text(messages) or ""
+                try:
+                    debug.phase(
+                        f"Build phase 2/5: validating graph and code (attempt {attempt})"
+                    )
+                    candidate = validate_candidate(parse_builder_response(raw))
+                    attempt_dir = archive_candidate(paths, candidate, attempt)
+                except Exception as error:
+                    _archive_invalid(paths, attempt, raw, error)
+                    debug.note(f"Validation failed: {error}")
+                    if attempts_this_run >= 3:
+                        raise RuntimeError(
+                            "builder failed validation three times; inspect "
+                            f"{paths.build_archive}"
+                        ) from error
+                    prompt = builder_repair_prompt(str(error))
+                    continue
 
             debug.idle()
             _print_candidate(candidate, paths.slug, attempt)
@@ -141,7 +156,12 @@ def _build(arguments: argparse.Namespace) -> int:
             if not decision:
                 print("Not approved; staged research was retained for review.")
                 return 1
-            feedback = decision
+            prompt = builder_repair_prompt(
+                decision,
+                previous_artifact=(
+                    None if candidate_known_to_thread else candidate
+                ),
+            )
             attempts_this_run = 0
 
 

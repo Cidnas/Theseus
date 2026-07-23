@@ -44,6 +44,9 @@ continue the conversation. `run()` returns the raw messages collected through
 `turn/completed`; `final_text()` extracts the last completed agent message. Pass
 `on_event=callback` to observe those messages as they arrive for UI progress,
 telemetry, or debugging without coupling that presentation to the runtime.
+Pass `output_schema={...}` when downstream code needs a schema-constrained final
+message, and `additional_context={"source": "..."}` to attach trusted
+application context without mixing it into the user's text.
 After rebuilding the in-memory tool catalog in a new Python process, call
 `resume_agent(thread_id, tools=[...], skills=[...])` before the next `run()` to
 restore the thread's capability selections.
@@ -129,6 +132,13 @@ requires two evaluator-accepted informative signals about its focus concepts,
 including at least one direct demonstration. The planner runs again only when
 all steps pass that gate or the current route is explicitly blocked. Graph,
 beliefs, plans, evidence, and all four Codex thread IDs persist in SQLite.
+
+Tutor turns use a single structured model completion. The host supplies only the
+active step and its recent evidence as application context, then atomically
+persists the tutor's evidence and optional checkpoint decision. The tutor does
+not reread the full graph, plan, or learner model on ordinary conversational
+turns; evaluator and planner agents still perform the deeper state work at the
+checkpoint boundaries where it affects learning decisions.
 
 `add_skill(name, description, instructions, resources=...)` installs a skill
 under the isolated Codex home. Select installed skills for a thread with
