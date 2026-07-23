@@ -41,7 +41,12 @@ print(final_text(messages))
 
 `create_agent()` returns a Codex thread ID. Reuse that ID with `run()` to
 continue the conversation. `run()` returns the raw messages collected through
-`turn/completed`; `final_text()` extracts the last completed agent message.
+`turn/completed`; `final_text()` extracts the last completed agent message. Pass
+`on_event=callback` to observe those messages as they arrive for UI progress,
+telemetry, or debugging without coupling that presentation to the runtime.
+After rebuilding the in-memory tool catalog in a new Python process, call
+`resume_agent(thread_id, tools=[...], skills=[...])` before the next `run()` to
+restore the thread's capability selections.
 
 ## Tools and skills
 
@@ -67,6 +72,63 @@ python sample.py
 The generated database lives at `.sample-data/shop.db`. Schema creation, seed
 data, and query helpers stay under `examples/shop_agent`, keeping the client
 script focused on the public workflow.
+
+## Prerequisite-graph tutor example
+
+[`examples/learning_agent`](examples/learning_agent) is a serious first version
+of a persistent adaptive tutor. A research agent generates a compact knowledge
+graph for a goal, an operator approves it, a planner creates 3-5 learning steps,
+a tutor teaches and gathers evidence, and a separate evaluator classifies that
+evidence. Numeric mastery updates and plan transitions are deterministic host
+code rather than model judgment.
+
+Build and review a topic:
+
+```bash
+python -m examples.learning_agent build \
+  --goal "Understand linear regression" \
+  --audience "adult beginner with basic arithmetic" \
+  --depth "able to fit, interpret, and diagnose a simple model"
+```
+
+The builder keeps research, sources, and validation logs in
+`.learning-data/builds/`. Generated Python is constrained to a fixed adapter,
+validated in a subprocess, and imported only after the operator types
+`approve`. Approved runtime packages deliberately exclude the research context.
+Long model operations print their current phase—research, validation, agent
+restoration, planning, tutoring, evaluation, gate resolution, or replanning.
+
+Continue the learner-only conversation with:
+
+```bash
+python -m examples.learning_agent chat understand-linear-regression
+```
+
+Add `--debug` to either command to show the current build phase or learning-plan
+step with a spinner, elapsed time, backend event count, and last activity. After
+60 seconds without a new app-server event it displays `QUIET`; the command's
+`--timeout` remains the hard failure boundary.
+
+```bash
+python -m examples.learning_agent build \
+  --goal "Understand linear regression" \
+  --audience "adult beginner" \
+  --depth "working practical knowledge" \
+  --debug
+
+python -m examples.learning_agent chat understand-linear-regression --debug
+```
+
+The animation is strictly a CLI adapter. The graph, persistence, agents, and
+state transitions have no terminal dependency; a frontend can construct
+`LearningRuntime` directly and optionally consume its progress and raw model-event
+callbacks. `CodexAppServer.run()` also exposes the generic `on_event` callback.
+
+Each plan has 3-5 steps, but a step has no turn budget. A completion checkpoint
+requires two evaluator-accepted informative signals about its focus concepts,
+including at least one direct demonstration. The planner runs again only when
+all steps pass that gate or the current route is explicitly blocked. Graph,
+beliefs, plans, evidence, and all four Codex thread IDs persist in SQLite.
 
 `add_skill(name, description, instructions, resources=...)` installs a skill
 under the isolated Codex home. Select installed skills for a thread with
@@ -114,8 +176,8 @@ non-interactive environment.
 - Tool functions must be synchronous; `async def` tools are not supported.
 - A Codex thread can have only one active run.
 - Cancelling `run_async()` does not send `turn/interrupt` to Codex.
-- A new `CodexAppServer` object can resume a thread by ID, but it does not
-  automatically recover that thread's tool and skill selections.
+- Applications are responsible for persisting thread IDs and passing their
+  tool and skill selections to `resume_agent()` after a process restart.
 
 ## Tests
 
@@ -133,4 +195,13 @@ CODEAGENT_LIVE_TEST=1 CODEX_AUTH_HOME="$HOME/.codex" \
   python -m unittest \
     tests.test_app_server.LiveCodexAppServerTests \
     tests.test_shop_agent_live.LiveShopAgentTests -v
+```
+
+The slower learning-system integration test runs real builder, planner, tutor,
+and evaluator model turns and reports seven progress phases:
+
+```bash
+CODEAGENT_LEARNING_LIVE_TEST=1 CODEX_AUTH_HOME="$HOME/.codex" \
+  python -m unittest \
+    tests.test_learning_agent.LiveLearningAgentTests -v
 ```

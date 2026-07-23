@@ -34,6 +34,7 @@ from ._helpers import (
 
 JsonObject: TypeAlias = dict[str, Any]
 ToolHandler: TypeAlias = Callable[[JsonObject], Any]
+EventHandler: TypeAlias = Callable[[JsonObject], None]
 _EOF = object()
 
 
@@ -138,11 +139,11 @@ class CodexAppServer:
         self.close()
 
     async def __aenter__(self) -> CodexAppServer:
-        await asyncio.to_thread(self.start)
+        await self._call_in_worker(self.start)
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        await asyncio.to_thread(self.close)
+        await self._call_in_worker(self.close)
 
     def import_auth(self, source_codex_home: str | os.PathLike[str]) -> Path:
         """Copy host credentials into the isolated home as an explicit action."""
@@ -261,12 +262,41 @@ class CodexAppServer:
             self._loaded_threads.add(thread_id)
         return thread_id
 
+    def resume_agent(
+        self,
+        thread_id: str,
+        *,
+        tools: Sequence[str] = (),
+        skills: Sequence[str] = (),
+    ) -> str:
+        """Restore a persisted thread with its registered capabilities.
+
+        Dynamic tools live in the embedding Python process, so applications must
+        rebuild the tool catalog and explicitly reattach the thread's selections
+        after a process restart.  The actual ``thread/resume`` request is deferred
+        until :meth:`run`, matching the lazy behavior used for unknown thread IDs.
+        """
+
+        if not thread_id.strip():
+            raise ValueError("thread_id cannot be empty")
+        with self._state_lock:
+            tool_names = _unique_names(tools, self._tools, "tool")
+            skill_names = _unique_names(skills, self._skills, "skill")
+            if thread_id in self._active_threads:
+                raise CodexAppServerError(
+                    f"thread already has an active run: {thread_id}"
+                )
+            self._agents[thread_id] = _Agent(tool_names, skill_names)
+            self._loaded_threads.discard(thread_id)
+        return thread_id
+
     def run(
         self,
         prompt: str,
         thread_id: str,
         *,
         timeout: float | None = None,
+        on_event: EventHandler | None = None,
     ) -> list[JsonObject]:
         """Run one prompt and return every raw app-server message for the turn."""
 
@@ -317,6 +347,7 @@ class CodexAppServer:
                 inbox=inbox,
                 events=events,
                 timeout=operation_timeout,
+                on_event=on_event,
             )
             turn_id = _nested_string(result, "turn", "id")
             deadline = time.monotonic() + operation_timeout
@@ -324,6 +355,8 @@ class CodexAppServer:
             while True:
                 message = self._next_message(inbox, deadline)
                 events.append(message)
+                if on_event is not None:
+                    on_event(message)
                 if self._is_server_request(message):
                     self._answer_server_request(message)
                     continue
@@ -347,15 +380,45 @@ class CodexAppServer:
         thread_id: str,
         *,
         timeout: float | None = None,
+        on_event: EventHandler | None = None,
     ) -> list[JsonObject]:
         """Run one prompt without blocking the caller's asyncio event loop."""
 
-        return await asyncio.to_thread(
-            self.run,
-            prompt,
-            thread_id,
-            timeout=timeout,
+        result = await self._call_in_worker(
+            lambda: self.run(
+                prompt,
+                thread_id,
+                timeout=timeout,
+                on_event=on_event,
+            )
         )
+        assert isinstance(result, list)
+        return result
+
+    async def _call_in_worker(self, function: Callable[[], Any]) -> Any:
+        """Run blocking lifecycle/turn work without relying on executor wakeups."""
+
+        # A dedicated worker plus Event polling is reliable when app-server pipe
+        # readers run inside restricted Linux sandboxes. Cancellation still does
+        # not interrupt the underlying Codex operation, as documented.
+        done = threading.Event()
+        outcome: list[Any | BaseException] = []
+
+        def invoke() -> None:
+            try:
+                outcome.append(function())
+            except BaseException as error:
+                outcome.append(error)
+            finally:
+                done.set()
+
+        threading.Thread(target=invoke, daemon=True).start()
+        while not done.is_set():
+            await asyncio.sleep(0.01)
+        result = outcome[0]
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def start(self) -> None:
         """Start app-server and perform the required initialize handshake."""
@@ -446,6 +509,7 @@ class CodexAppServer:
         inbox: queue.Queue[JsonObject | BaseException | object] | None = None,
         events: list[JsonObject] | None = None,
         timeout: float | None = None,
+        on_event: EventHandler | None = None,
     ) -> JsonObject:
         response_inbox = inbox if inbox is not None else queue.Queue()
         with self._state_lock:
@@ -469,6 +533,8 @@ class CodexAppServer:
                 message = self._next_message(response_inbox, deadline)
                 if events is not None:
                     events.append(message)
+                    if on_event is not None:
+                        on_event(message)
                 if self._is_server_request(message):
                     self._answer_server_request(message)
                     continue

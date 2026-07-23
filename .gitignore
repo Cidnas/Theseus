@@ -1,4 +1,5 @@
 .codex-agent/
 .sample-data/
+.learning-data/
 __pycache__/
 *.py[cod]

@@ -26,6 +26,7 @@ class CodexAppServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             calls: list[dict[str, object]] = []
+            observed_events: list[dict[str, object]] = []
             with self.make_client(project) as client:
                 client.add_tool(
                     "double",
@@ -52,9 +53,12 @@ class CodexAppServerTests(unittest.TestCase):
                 thread_id = client.create_agent(
                     tools=["double"], skills=["selected-skill"], sandbox="read-only"
                 )
-                raw = client.run("Use the tool.", thread_id)
+                raw = client.run(
+                    "Use the tool.", thread_id, on_event=observed_events.append
+                )
 
             self.assertEqual(calls, [{"value": 7}])
+            self.assertEqual(observed_events, raw)
             self.assertEqual(raw[-1]["method"], "turn/completed")
             payload = json.loads(final_text(raw) or "{}")
             self.assertEqual(payload["codexHome"], str(project / ".codex-agent"))
@@ -123,6 +127,45 @@ class CodexAppServerTests(unittest.TestCase):
             payload = json.loads(final_text(raw) or "{}")
             self.assertEqual(payload["threadParams"]["threadId"], thread_id)
 
+    def test_resume_agent_reattaches_tools_after_client_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            first = self.make_client(project)
+            first.add_tool(
+                "double",
+                "Double an integer.",
+                {"type": "object", "properties": {"value": {"type": "integer"}}},
+                lambda arguments: arguments["value"] * 2,
+            )
+            thread_id = first.create_agent(tools=["double"])
+            first.close()
+
+            calls: list[dict[str, object]] = []
+            second = self.make_client(project)
+            second.add_tool(
+                "double",
+                "Double an integer.",
+                {"type": "object", "properties": {"value": {"type": "integer"}}},
+                lambda arguments: calls.append(arguments) or arguments["value"] * 2,
+            )
+            second.resume_agent(thread_id, tools=["double"])
+            try:
+                raw = second.run("Use the restored tool.", thread_id)
+            finally:
+                second.close()
+
+            payload = json.loads(final_text(raw) or "{}")
+            self.assertEqual(calls, [{"value": 7}])
+            self.assertEqual(
+                payload["threadParams"]["dynamicTools"][0]["name"], "double"
+            )
+
+    def test_resume_agent_rejects_unknown_capabilities(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.make_client(Path(directory)) as client:
+                with self.assertRaisesRegex(KeyError, "unknown tool"):
+                    client.resume_agent("thread-1", tools=["missing"])
+
     def test_different_agents_can_run_in_parallel_without_mixing_messages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -187,7 +230,14 @@ class LiveCodexAppServerTests(unittest.TestCase):
             client.import_auth(source_home)
             with client:
                 thread_id = client.create_agent(sandbox="read-only")
-                raw = client.run("Reply with exactly: CODEAGENT_OK", thread_id)
+                observed_events: list[dict[str, object]] = []
+                raw = client.run(
+                    "Reply with exactly: CODEAGENT_OK",
+                    thread_id,
+                    on_event=observed_events.append,
+                )
+            self.assertEqual(observed_events, raw)
+            self.assertGreater(len(observed_events), 1)
             self.assertEqual(
                 final_text(raw),
                 "CODEAGENT_OK",

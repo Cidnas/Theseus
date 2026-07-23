@@ -1,0 +1,279 @@
+"""Four-agent orchestration over the deterministic learning state engine."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+from codeagent import CodexAppServer, final_text, register_tools
+
+from .build import TopicPaths, load_generated_tools
+from .database import LearningStore
+from .tools import EVALUATOR_TOOLS, PLANNER_TOOLS, TUTOR_TOOLS
+
+
+ROLE_TOOLS = {
+    "tutor": TUTOR_TOOLS,
+    "evaluator": EVALUATOR_TOOLS,
+    "planner": PLANNER_TOOLS,
+}
+
+ROLE_INSTRUCTIONS = {
+    "tutor": """
+You are the learner-facing tutor. The learner sees only your final conversational
+reply, never internal state or other agents. At the start of every turn, inspect
+the current learning plan and learner model. Work only on the active step and its
+available prerequisite frontier.
+
+Teach naturally and ask useful questions. A step may take unlimited conversational
+turns. Record concrete signals with submit_mastery_evidence, linked only to the
+concept actually evidenced. Evidence must quote or precisely summarize what the
+learner did; do not grade it and never modify mastery probabilities. Self-reports
+are evidence but are not direct demonstrations.
+
+Signal a completed checkpoint only when the active step's completion criteria
+appear met and enough useful evidence has been gathered. Signal blocked only when
+the route is unsuitable or the learner cannot progress, not merely because more
+teaching is needed. The host, evaluator, and evidence gate decide transitions.
+Do not mention tools, agents, probabilities, hidden plans, or evidence machinery.
+""",
+    "evaluator": """
+You are a strict evidence evaluator, not a tutor or planner. Use
+list_pending_mastery_evidence and assess every pending record exactly once against
+the linked concept's mastery criteria. You may choose only:
+- judgment: demonstrated, partial, contradicted, uninformative
+- quality: direct, indirect, self_report
+
+Direct means the learner actually explained, solved, produced, or applied
+something. Indirect is a weaker behavioral inference. A claim about one's own
+knowledge is self_report. Provide a concise criterion-grounded rationale. Never
+invent numeric updates; deterministic host code owns probabilities.
+""",
+    "planner": """
+You are the learning planner. Inspect the graph, learner model, and previous plan.
+Choose the shortest viable prerequisite route exposed by readiness and restrict
+focus to its available frontier. Build a roadmap plus one plan of 3-5 ordered
+steps. A step is an objective and teaching strategy, never a scripted turn count;
+it may take unlimited conversation turns.
+
+Call save_learning_plan exactly once with the current state_revision and a JSON
+object shaped as:
+{
+  "goal_id": "graph goal_concept_id",
+  "roadmap": "short rationale and direction",
+  "route": ["concept_id"],
+  "steps": [{
+    "step_id": "stable_short_id",
+    "concept_ids": ["concept_id"],
+    "objective": "observable learning objective",
+    "mode": "diagnose|teach|practice|integrate",
+    "strategy": "adaptive instructional approach",
+    "probes": ["suggested elicitation or practice probe"],
+    "completion_criteria": ["observable criterion"]
+  }]
+}
+Do not include statuses or numeric mastery updates; the host owns them. Every
+step needs at least one probe and completion criterion. Return a short internal
+confirmation after the tool succeeds.
+""",
+}
+
+
+class LearningRuntime:
+    """Create/resume role agents and drive hidden checkpoint transitions."""
+
+    def __init__(
+        self,
+        project_root: str | Path,
+        topic: TopicPaths,
+        codex: CodexAppServer,
+        on_progress: Callable[[str], None] | None = None,
+        on_model_event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
+        self.project_root = Path(project_root).resolve()
+        self.topic = topic
+        self.codex = codex
+        self.store = LearningStore(topic.database)
+        self.on_progress = on_progress
+        self.on_model_event = on_model_event
+        self.threads: dict[str, str] = {}
+        self._registered = False
+
+    def prepare(self) -> None:
+        """Register generated tools and restore or create all runtime agents."""
+
+        if self._registered:
+            return
+        self._report("Validating the approved topic and registering its tools")
+        tool_names = register_tools(self.codex, load_generated_tools(self.topic))
+        if set(tool_names) != set().union(*map(set, ROLE_TOOLS.values())):
+            raise RuntimeError("generated topic did not register the eight-tool contract")
+        sessions = self.store.get_agent_sessions()
+        self._report("Restoring persisted builder, tutor, evaluator, and planner threads")
+        builder = sessions.get("builder")
+        if builder:
+            self.codex.resume_agent(
+                builder["thread_id"], tools=builder["tools"], skills=builder["skills"]
+            )
+            self.threads["builder"] = builder["thread_id"]
+        for role, selected in ROLE_TOOLS.items():
+            saved = sessions.get(role)
+            if saved:
+                if tuple(saved["tools"]) != tuple(selected):
+                    raise RuntimeError(f"persisted {role} capability set is invalid")
+                thread_id = self.codex.resume_agent(
+                    saved["thread_id"], tools=selected, skills=saved["skills"]
+                )
+            else:
+                thread_id = self.codex.create_agent(
+                    tools=selected,
+                    sandbox="read-only",
+                    approval_policy="never",
+                    developer_instructions=ROLE_INSTRUCTIONS[role].strip(),
+                )
+                self.store.save_agent_session(role, thread_id, list(selected))
+            self.threads[role] = thread_id
+        self._registered = True
+        self._report("All agent threads are ready")
+
+    def ensure_active_plan(self) -> dict[str, Any]:
+        """Create the initial plan or refresh a completed/blocked plan."""
+
+        self.prepare()
+        plan = self.store.get_learning_plan()
+        if plan is None:
+            return self.run_planner("Create the initial learning plan.")
+        if plan["status"] in {"completed", "blocked"}:
+            return self.run_planner(
+                f"Replace plan {plan['plan_id']} because it is {plan['status']}."
+            )
+        self._report_active_step(plan)
+        return plan
+
+    def tutor_turn(self, learner_message: str) -> str:
+        """Run one unrestricted tutor turn, then process any hidden checkpoint."""
+
+        if not learner_message.strip():
+            raise ValueError("learner message cannot be empty")
+        plan = self.ensure_active_plan()
+        active = next(step for step in plan["steps"] if step["status"] == "active")
+        self._report(f"Tutor model is working on step {active['step_id']}")
+        messages = self.codex.run(
+            learner_message,
+            self.threads["tutor"],
+            on_event=self._event_handler("tutor"),
+        )
+        answer = final_text(messages)
+        if answer is None:
+            raise RuntimeError("tutor completed without a learner-facing response")
+        self.process_checkpoints()
+        return answer
+
+    def process_checkpoints(self) -> list[dict[str, Any]]:
+        """Evaluate checkpoint evidence and replan only at allowed boundaries."""
+
+        outcomes: list[dict[str, Any]] = []
+        for checkpoint in self.store.pending_checkpoints():
+            self._report(
+                f"Evaluator is reviewing evidence for step {checkpoint['step_id']}"
+            )
+            self.run_evaluator(checkpoint)
+            self._report(f"Applying the evidence gate for step {checkpoint['step_id']}")
+            outcome = self.store.resolve_checkpoint(checkpoint["id"])
+            if outcome["status"] == "waiting_for_evaluator":
+                raise RuntimeError("evaluator left checkpoint evidence unassessed")
+            outcomes.append(outcome)
+            self._report(f"Checkpoint result: {outcome['status'].replace('_', ' ')}")
+            if outcome["status"] in {"plan_completed", "blocked"}:
+                self.run_planner(
+                    "Create a new plan after " + outcome["status"].replace("_", " ") + "."
+                )
+            else:
+                current = self.store.get_learning_plan()
+                if current is not None:
+                    self._report_active_step(current)
+        return outcomes
+
+    def run_evaluator(self, checkpoint: dict[str, Any]) -> None:
+        """Ask the evaluator to exhaust the pending evidence queue."""
+
+        self.prepare()
+        pending = self.store.list_pending_mastery_evidence()
+        if not pending:
+            return
+        prompt = (
+            f"Evaluate all pending evidence for checkpoint {checkpoint['id']} "
+            f"on plan {checkpoint['plan_id']} step {checkpoint['step_id']}. "
+            "Call the assessment tool once for every record, including records "
+            "that are uninformative. Do not stop while any record remains pending."
+        )
+        self.codex.run(
+            prompt,
+            self.threads["evaluator"],
+            on_event=self._event_handler("evaluator"),
+        )
+        remaining = self.store.list_pending_mastery_evidence()
+        if remaining:
+            raise RuntimeError(
+                "evaluator did not assess evidence IDs: "
+                + ", ".join(str(item["id"]) for item in remaining)
+            )
+
+    def run_planner(self, reason: str) -> dict[str, Any]:
+        """Run the planner and verify that it persisted a fresh active plan."""
+
+        self.prepare()
+        revision = self.store.get_learner_model()["state_revision"]
+        previous = self.store.get_learning_plan()
+        previous_id = previous["plan_id"] if previous else 0
+        self._report("Planner model is creating the next 3-5-step learning plan")
+        prompt = (
+            f"{reason} Current learner state_revision is {revision}. Inspect all "
+            "available state with your tools, then persist the new plan."
+        )
+        self.codex.run(
+            prompt,
+            self.threads["planner"],
+            on_event=self._event_handler("planner"),
+        )
+        plan = self.store.get_learning_plan()
+        if (
+            plan is None
+            or plan["plan_id"] <= previous_id
+            or plan["status"] != "active"
+            or plan["based_on_state_revision"] != revision
+        ):
+            raise RuntimeError("planner did not persist a fresh plan")
+        self._report_active_step(plan)
+        return plan
+
+    def _report_active_step(self, plan: dict[str, Any]) -> None:
+        active = next(
+            (step for step in plan["steps"] if step["status"] == "active"),
+            None,
+        )
+        if active is None:
+            self._report(f"Plan {plan['plan_id']} has status {plan['status']}")
+            return
+        index = plan["steps"].index(active) + 1
+        self._report(
+            f"Plan {plan['plan_id']}, step {index}/{len(plan['steps'])}: "
+            f"{active['step_id']} — {active['objective']}"
+        )
+
+    def _report(self, message: str) -> None:
+        if self.on_progress is not None:
+            self.on_progress(message)
+
+    def _event_handler(self, role: str) -> Callable[[dict[str, Any]], None] | None:
+        if self.on_model_event is None:
+            return None
+        return lambda event: self.on_model_event(role, event)
+
+
+def plan_as_pretty_json(plan: dict[str, Any]) -> str:
+    """Small debugging helper intentionally unused by the learner-facing CLI."""
+
+    return json.dumps(plan, indent=2, sort_keys=True, ensure_ascii=False)
