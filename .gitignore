@@ -1,5 +1,6 @@
 .codex-agent/
-.sample-data/
-.learning-data/
+build/
+dist/
+*.egg-info/
 __pycache__/
 *.py[cod]

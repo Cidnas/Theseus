@@ -9,6 +9,7 @@ from .app_server import (
     final_text,
 )
 from .tool_adapter import register_tools
+from ._version import __version__
 
 __all__ = [
     "CodexAppServer",
@@ -18,4 +19,5 @@ __all__ = [
     "CodexTimeoutError",
     "final_text",
     "register_tools",
+    "__version__",
 ]

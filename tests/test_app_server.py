@@ -280,70 +280,20 @@ class LiveCodexAppServerTests(unittest.TestCase):
                 msg=json.dumps(raw, indent=2, sort_keys=True),
             )
 
-    def test_real_structured_tutor_turn_with_application_context(self) -> None:
+    def test_real_structured_output_with_application_context(self) -> None:
         source_home = os.environ.get("CODEX_AUTH_HOME")
         if not source_home:
             self.skipTest("CODEX_AUTH_HOME is not set")
         schema = {
             "type": "object",
             "properties": {
-                "reply": {"type": "string", "minLength": 1},
-                "evidence": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "concept_id": {
-                                "type": "string",
-                                "enum": ["quantitative_variables"],
-                            },
-                            "evidence": {"type": "string", "minLength": 1},
-                            "elicitation_context": {
-                                "type": "string",
-                                "minLength": 1,
-                            },
-                        },
-                        "required": [
-                            "concept_id",
-                            "evidence",
-                            "elicitation_context",
-                        ],
-                        "additionalProperties": False,
-                    },
-                },
-                "checkpoint": {
-                    "anyOf": [
-                        {"type": "null"},
-                        {
-                            "type": "object",
-                            "properties": {
-                                "status": {
-                                    "type": "string",
-                                    "enum": ["completed", "blocked"],
-                                },
-                                "summary": {"type": "string"},
-                            },
-                            "required": ["status", "summary"],
-                            "additionalProperties": False,
-                        },
-                    ]
-                },
+                "marker": {"type": "string", "minLength": 1},
+                "accepted": {"type": "boolean"},
             },
-            "required": ["reply", "evidence", "checkpoint"],
+            "required": ["marker", "accepted"],
             "additionalProperties": False,
         }
-        context = json.dumps(
-            {
-                "step": {
-                    "concept_ids": ["quantitative_variables"],
-                    "objective": "Classify measured quantities and numerical labels.",
-                    "completion_criteria": [
-                        "Correctly classify several cases and justify the distinction."
-                    ],
-                },
-                "prior_evidence": [],
-            }
-        )
+        context = json.dumps({"marker": "CODEAGENT_CONTEXT_OK"})
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             client = CodexAppServer(project, timeout=180)
@@ -352,25 +302,19 @@ class LiveCodexAppServerTests(unittest.TestCase):
                 thread_id = client.create_agent(
                     sandbox="read-only",
                     developer_instructions=(
-                        "You are a concise tutor. Use the trusted active-step context. "
-                        "Record criterion-relevant evidence in the structured response."
+                        "Use trusted application context exactly as requested."
                     ),
                 )
                 raw = client.run(
-                    'The learner says: "Height in centimeters is a measured amount." '
-                    "Respond naturally, record one evidence item, and do not checkpoint.",
+                    "Copy the marker from the integration record and set accepted to true.",
                     thread_id,
                     output_schema=schema,
-                    additional_context={"active_learning_step": context},
+                    additional_context={"integration_record": context},
                 )
 
         result = json.loads(final_text(raw) or "{}")
-        self.assertTrue(result["reply"].strip())
-        self.assertEqual(len(result["evidence"]), 1)
-        self.assertEqual(
-            result["evidence"][0]["concept_id"], "quantitative_variables"
-        )
-        self.assertIsNone(result["checkpoint"])
+        self.assertEqual(result["marker"], "CODEAGENT_CONTEXT_OK")
+        self.assertIs(result["accepted"], True)
 
     def test_real_custom_skill_and_tool(self) -> None:
         source_home = os.environ.get("CODEX_AUTH_HOME")

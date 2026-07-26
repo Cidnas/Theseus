@@ -149,26 +149,7 @@ while request := receive():
             "turnParams": params,
             "toolResponse": tool_response,
         }
-        application_context = params.get("additionalContext", {})
-        active_step = application_context.get("active_learning_step")
-        if isinstance(active_step, dict):
-            context = json.loads(active_step["value"])
-            response_text = json.dumps(
-                {
-                    "reply": "Fast structured tutor reply.",
-                    "evidence": [
-                        {
-                            "concept_id": context["step"]["concept_ids"][0],
-                            "evidence": "The learner supplied a relevant answer.",
-                            "elicitation_context": "The active-step practice prompt.",
-                        }
-                    ],
-                    "checkpoint": None,
-                },
-                sort_keys=True,
-            )
-        else:
-            response_text = json.dumps(payload, sort_keys=True)
+        response_text = json.dumps(payload, sort_keys=True)
         send(
             {
                 "method": "item/completed",

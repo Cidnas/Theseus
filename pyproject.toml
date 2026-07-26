@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codeagent"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Embed the local Codex app-server in Python applications"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -12,3 +12,6 @@ dependencies = []
 
 [tool.setuptools.packages.find]
 include = ["codeagent*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "codeagent._version.__version__"}
