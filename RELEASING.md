@@ -1,6 +1,6 @@
-# Releasing codeAgent
+# Releasing Theseus
 
-Every consuming project must pin an immutable `codeagent` release. Changes are
+Every consuming project must pin an immutable `theseus` release. Changes are
 made in this repository, verified here, and released centrally rather than
 patched inside an application.
 
@@ -35,7 +35,7 @@ release unless they accompany a distributable change.
 ## Release checklist
 
 1. Choose the version from the policy above.
-2. Set `codeagent/_version.py` to that version.
+2. Set `theseus/_version.py` to that version.
 3. Move the changelog's `Unreleased` entries under a heading containing the
    version and release date, then create a fresh empty `Unreleased` section.
 4. Run the full approved test suite.
@@ -51,7 +51,7 @@ release unless they accompany a distributable change.
 8. Create an annotated, signed tag when signing is configured:
 
    ```bash
-   git tag -s vX.Y.Z -m "codeagent X.Y.Z"
+   git tag -s vX.Y.Z -m "Theseus X.Y.Z"
    ```
 
    Otherwise, create an annotated tag with `git tag -a`.

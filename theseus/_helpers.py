@@ -1,4 +1,4 @@
-"""Validation and filesystem helpers for :mod:`codeagent.app_server`."""
+"""Validation and filesystem helpers for :mod:`theseus.app_server`."""
 
 from __future__ import annotations
 

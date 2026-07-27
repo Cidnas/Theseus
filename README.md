@@ -1,6 +1,6 @@
-# codeAgent
+# Theseus
 
-`codeAgent` is a small Python library for embedding the local Codex app-server
+`Theseus` is a small Python library for embedding the local Codex app-server
 in an application. It manages the app-server process, isolated project state,
 Codex threads, dynamic Python tools, skills, streamed events, and concurrent
 runs.
@@ -16,7 +16,7 @@ project owns its prompts, tools, skills, persistence, API, and user interface.
   `CODEX_ACCESS_TOKEN`
 
 The Codex app-server protocol is experimental. Applications should pin a
-`codeagent` release and upgrade intentionally.
+`theseus` release and upgrade intentionally.
 
 ## Installation
 
@@ -25,10 +25,10 @@ a Git submodule and install it editably:
 
 ```bash
 git submodule add \
-  git@github.com:Cidnas/codexAgent.git \
-  packages/codeagent
+  git@github.com:Cidnas/Theseus.git \
+  packages/theseus
 
-uv add --editable ./packages/codeagent
+uv add --editable ./packages/theseus
 ```
 
 The consuming repository records the exact package commit. Clone it later with:
@@ -38,7 +38,7 @@ git clone --recurse-submodules <consumer-repository-url>
 uv sync
 ```
 
-When changing the package, commit and push inside `packages/codeagent` first.
+When changing the package, commit and push inside `packages/theseus` first.
 Then commit the updated submodule pointer in the consuming repository.
 See [docs/submodule-quickstart.md](docs/submodule-quickstart.md) for the complete
 add, clone, edit, push, and upgrade workflow.
@@ -48,11 +48,21 @@ directly on an immutable release tag:
 
 ```toml
 dependencies = [
-    "codeagent @ git+ssh://git@github.com/Cidnas/codexAgent.git@v0.1.0",
+    "theseus @ git+ssh://git@github.com/Cidnas/Theseus.git@<release-tag>",
 ]
 ```
 
 Do not make production projects depend on an unpinned branch such as `main`.
+
+### Migrating from 0.1.0
+
+Update imports from `codeagent` to `theseus`. Before starting Theseus in an
+existing project, preserve its local credentials and thread history by moving
+the private state directory:
+
+```bash
+mv .codex-agent .theseus
+```
 
 ## Public API
 
@@ -99,7 +109,7 @@ run concurrently, but one thread can have only one active run.
 
 ## Authentication and state
 
-State is stored under `<project>/.codex-agent` by default, separate from the
+State is stored under `<project>/.theseus` by default, separate from the
 normal Codex home. The directory may contain credentials and conversation
 history and must not be committed.
 
@@ -127,7 +137,7 @@ The optional live app-server tests use local Codex authentication and make real
 model calls:
 
 ```bash
-CODEAGENT_LIVE_TEST=1 CODEX_AUTH_HOME="$HOME/.codex" \
+THESEUS_LIVE_TEST=1 CODEX_AUTH_HOME="$HOME/.codex" \
   python -m unittest tests.test_app_server.LiveCodexAppServerTests -v
 ```
 

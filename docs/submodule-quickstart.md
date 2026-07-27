@@ -1,6 +1,6 @@
-# Using codeAgent as an editable submodule
+# Using Theseus as an editable submodule
 
-This setup keeps `codeagent` inside the consuming project while preserving it
+This setup keeps `theseus` inside the consuming project while preserving it
 as a separate Git repository. The consuming project records the exact package
 commit, and Python imports directly from the editable checkout.
 
@@ -10,23 +10,23 @@ From the consuming project's root:
 
 ```bash
 git submodule add \
-  git@github.com:Cidnas/codexAgent.git \
-  packages/codeagent
+  git@github.com:Cidnas/Theseus.git \
+  packages/theseus
 
-uv add --editable ./packages/codeagent
+uv add --editable ./packages/theseus
 ```
 
 Commit the setup in the consuming project:
 
 ```bash
-git add .gitmodules packages/codeagent pyproject.toml uv.lock
-git commit -m "Add codeagent backend"
+git add .gitmodules packages/theseus pyproject.toml uv.lock
+git commit -m "Add theseus backend"
 ```
 
 Application code can now import the package normally:
 
 ```python
-from codeagent import CodexAppServer, final_text, register_tools
+from theseus import CodexAppServer, final_text, register_tools
 ```
 
 ## Clone a consuming project
@@ -52,7 +52,7 @@ Enter the submodule and confirm that Git is operating on the package
 repository:
 
 ```bash
-cd packages/codeagent
+cd packages/theseus
 git rev-parse --show-toplevel
 git remote -v
 git switch -c fix/<short-description>
@@ -77,22 +77,22 @@ update the consuming project to the released commit or tag:
 
 ```bash
 git fetch --tags
-git checkout v0.1.1
+git checkout <release-tag>
 cd ../..
 uv sync
-git add packages/codeagent uv.lock
-git commit -m "Update codeagent to v0.1.1"
+git add packages/theseus uv.lock
+git commit -m "Update theseus to <release-tag>"
 ```
 
 ## Remember the two repositories
 
 - Commands run at the consuming-project root use the consuming project's
   `origin`.
-- Commands run inside `packages/codeagent` use the package repository's
+- Commands run inside `packages/theseus` use the package repository's
   `origin`.
 - Push the package commit before committing its updated pointer in the
   consuming project.
 - Do not edit `.venv/site-packages`; the editable installation already imports
-  from `packages/codeagent`.
+  from `packages/theseus`.
 - Clone with `--recurse-submodules`, or initialize submodules before running
   `uv sync`.

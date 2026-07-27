@@ -1,4 +1,4 @@
-# codeAgent repository instructions
+# Theseus repository instructions
 
 These instructions apply to the entire repository. Read `README.md`,
 `CONTRIBUTING.md`, and `RELEASING.md` before making a public API, packaging,
@@ -16,7 +16,7 @@ state, protocol, or release change.
 
 ## Compatibility
 
-- Treat exports from `codeagent/__init__.py` as the public API.
+- Treat exports from `theseus/__init__.py` as the public API.
 - Preserve documented behavior unless a breaking change is explicitly
   approved and versioned.
 - Keep backend protocol details behind the public Python interface.
@@ -27,10 +27,10 @@ state, protocol, or release change.
 
 ## State and credentials
 
-- `.codex-agent/` is generated local runtime state. It can contain credentials,
+- `.theseus/` is generated local runtime state. It can contain credentials,
   conversation history, skills, caches, and databases.
 - Never commit, inspect unnecessarily, copy into fixtures, or delete
-  `.codex-agent/` without explicit owner approval.
+  `.theseus/` without explicit owner approval.
 - Tests must use temporary directories and fake credentials or protocol data.
 - Do not print tokens, authentication files, prompts, or conversation history.
 
