@@ -1,6 +1,6 @@
-# Contributing to codeAgent
+# Contributing to Theseus
 
-`codeAgent` is shared infrastructure used by multiple application repositories.
+`Theseus` is shared infrastructure used by multiple application repositories.
 A change here can affect every project that upgrades to it, so contributions
 must protect the library boundary and remain intentionally versioned.
 
@@ -62,7 +62,7 @@ consuming project would break if this test disappeared?
 
 ## State and security
 
-The `.codex-agent/` directory is generated separately for each project. It may
+The `.theseus/` directory is generated separately for each project. It may
 contain authentication, conversations, databases, skills, and caches. It is
 not source code and must remain ignored. Do not inspect, copy, publish, or
 delete another project's state without explicit approval.

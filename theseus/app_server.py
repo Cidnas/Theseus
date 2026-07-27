@@ -79,7 +79,7 @@ class _Agent:
 class CodexAppServer:
     """Run Codex threads through an isolated, project-local app-server.
 
-    By default all Codex state is written under ``<project>/.codex-agent``.
+    By default all Codex state is written under ``<project>/.theseus``.
     Authentication is never silently copied from the host Codex installation;
     call :meth:`import_auth` explicitly or authenticate that local home.
     """
@@ -99,7 +99,7 @@ class CodexAppServer:
         self.codex_home = (
             Path(codex_home).expanduser().resolve()
             if codex_home is not None
-            else self.project_root / ".codex-agent"
+            else self.project_root / ".theseus"
         )
         ensure_private_directory(self.codex_home)
         ensure_private_directory(self.codex_home / "skills")
@@ -510,8 +510,8 @@ class CodexAppServer:
                 "initialize",
                 {
                     "clientInfo": {
-                        "name": "codeagent",
-                        "title": "codeAgent Python module",
+                        "name": "theseus",
+                        "title": "Theseus Python module",
                         "version": "0.1.0",
                     },
                     "capabilities": {"experimentalApi": True},

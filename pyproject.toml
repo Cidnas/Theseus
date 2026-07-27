@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "codeagent"
+name = "Theseus"
 dynamic = ["version"]
 description = "Embed the local Codex app-server in Python applications"
 readme = "README.md"
@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 dependencies = []
 
 [tool.setuptools.packages.find]
-include = ["codeagent*"]
+include = ["theseus*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "codeagent._version.__version__"}
+version = {attr = "theseus._version.__version__"}

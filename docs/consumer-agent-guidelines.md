@@ -1,7 +1,7 @@
 # Coding-agent guidance for consuming projects
 
 Coding agents only discover instructions in the repository where they are
-working. Installing `codeagent` does not automatically apply this repository's
+working. Installing `theseus` does not automatically apply this repository's
 `AGENTS.md` to an application repository.
 
 Copy the following section into the consuming project's root `AGENTS.md` and
@@ -12,16 +12,16 @@ adapt the paths or commands that are specific to that project.
 ```markdown
 ## Shared agent backend
 
-This project uses `codeagent` as a versioned dependency from
-https://github.com/Cidnas/codexAgent, checked out as the Git submodule
-`packages/codeagent` and installed as an editable dependency.
+This project uses `theseus` as a versioned dependency from
+https://github.com/Cidnas/Theseus, checked out as the Git submodule
+`packages/theseus` and installed as an editable dependency.
 
-- Treat `packages/codeagent` as a separate upstream Git repository. Never patch
+- Treat `packages/theseus` as a separate upstream Git repository. Never patch
   `site-packages` or copy its source into the consuming application's modules.
-- Before committing or pushing package changes, enter `packages/codeagent` and
+- Before committing or pushing package changes, enter `packages/theseus` and
   confirm its repository root and remote with `git rev-parse --show-toplevel`
   and `git remote -v`.
-- Commit and push shared-package changes inside `packages/codeagent` first.
+- Commit and push shared-package changes inside `packages/theseus` first.
   Then return to the consuming repository and commit its updated submodule
   pointer.
 - Keep this project's prompts, tools, business rules, persistence, API, and UI
@@ -31,7 +31,7 @@ https://github.com/Cidnas/codexAgent, checked out as the Git submodule
   to the released submodule commit.
 - Keep the submodule pinned to an intentional commit, preferably an immutable
   release tag for production.
-- Treat `.codex-agent/` as private generated runtime state. Never commit it,
+- Treat `.theseus/` as private generated runtime state. Never commit it,
   inspect it unnecessarily, place its contents in tests, or delete it without
   explicit owner approval.
 - Persist thread IDs and their selected tool and skill names in the

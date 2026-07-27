@@ -1,7 +1,17 @@
 # Changelog
 
-All notable changes to `codeagent` are recorded here. Releases follow the
+All notable changes to `theseus` are recorded here. Releases follow the
 versioning policy in [RELEASING.md](RELEASING.md).
+
+## Unreleased
+
+### Changed
+
+- Renamed the project, Python distribution, and import package from
+  `codeagent` to `Theseus`/`theseus`.
+- Changed the default private runtime-state directory from `.codex-agent/` to
+  `.theseus/`. Existing consumers should move the directory before starting
+  Theseus to preserve authentication and thread history.
 
 ## 0.1.0 - 2026-07-26
 

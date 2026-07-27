@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codeagent import CodexAppServer, final_text
+from theseus import CodexAppServer, final_text
 
 
 FAKE_SERVER = Path(__file__).with_name("fake_app_server.py")
@@ -61,7 +61,7 @@ class CodexAppServerTests(unittest.TestCase):
             self.assertEqual(observed_events, raw)
             self.assertEqual(raw[-1]["method"], "turn/completed")
             payload = json.loads(final_text(raw) or "{}")
-            self.assertEqual(payload["codexHome"], str(project / ".codex-agent"))
+            self.assertEqual(payload["codexHome"], str(project / ".theseus"))
             self.assertEqual(
                 payload["threadParams"]["dynamicTools"][0]["name"], "double"
             )
@@ -73,7 +73,7 @@ class CodexAppServerTests(unittest.TestCase):
                 {"contentItems": [{"type": "inputText", "text": "14"}], "success": True},
             )
             self.assertEqual(
-                (project / ".codex-agent/skills/selected-skill/references/example.txt").read_text(),
+                (project / ".theseus/skills/selected-skill/references/example.txt").read_text(),
                 "example",
             )
 
@@ -254,7 +254,7 @@ class CodexAppServerTests(unittest.TestCase):
                     client.create_agent(tools=["missing"])
 
 
-@unittest.skipUnless(os.environ.get("CODEAGENT_LIVE_TEST") == "1", "live test disabled")
+@unittest.skipUnless(os.environ.get("THESEUS_LIVE_TEST") == "1", "live test disabled")
 class LiveCodexAppServerTests(unittest.TestCase):
     def test_real_prompt_round_trip(self) -> None:
         source_home = os.environ.get("CODEX_AUTH_HOME")
@@ -268,7 +268,7 @@ class LiveCodexAppServerTests(unittest.TestCase):
                 thread_id = client.create_agent(sandbox="read-only")
                 observed_events: list[dict[str, object]] = []
                 raw = client.run(
-                    "Reply with exactly: CODEAGENT_OK",
+                    "Reply with exactly: THESEUS_OK",
                     thread_id,
                     on_event=observed_events.append,
                 )
@@ -276,7 +276,7 @@ class LiveCodexAppServerTests(unittest.TestCase):
             self.assertGreater(len(observed_events), 1)
             self.assertEqual(
                 final_text(raw),
-                "CODEAGENT_OK",
+                "THESEUS_OK",
                 msg=json.dumps(raw, indent=2, sort_keys=True),
             )
 
@@ -293,7 +293,7 @@ class LiveCodexAppServerTests(unittest.TestCase):
             "required": ["marker", "accepted"],
             "additionalProperties": False,
         }
-        context = json.dumps({"marker": "CODEAGENT_CONTEXT_OK"})
+        context = json.dumps({"marker": "THESEUS_CONTEXT_OK"})
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             client = CodexAppServer(project, timeout=180)
@@ -313,7 +313,7 @@ class LiveCodexAppServerTests(unittest.TestCase):
                 )
 
         result = json.loads(final_text(raw) or "{}")
-        self.assertEqual(result["marker"], "CODEAGENT_CONTEXT_OK")
+        self.assertEqual(result["marker"], "THESEUS_CONTEXT_OK")
         self.assertIs(result["accepted"], True)
 
     def test_real_custom_skill_and_tool(self) -> None:
@@ -329,11 +329,11 @@ class LiveCodexAppServerTests(unittest.TestCase):
                 "integration_value",
                 "Return the fixed integration-test value.",
                 {"type": "object", "properties": {}, "additionalProperties": False},
-                lambda arguments: calls.append(arguments) or "CODEAGENT_TOOL_OK",
+                lambda arguments: calls.append(arguments) or "THESEUS_TOOL_OK",
             )
             client.add_skill(
                 "integration-check",
-                "Exercise the codeAgent dynamic-tool bridge.",
+                "Exercise the Theseus dynamic-tool bridge.",
                 "Call integration_value exactly once and return only the tool's text output.",
             )
             with client:
@@ -346,7 +346,7 @@ class LiveCodexAppServerTests(unittest.TestCase):
             self.assertEqual(calls, [{}], msg=json.dumps(raw, indent=2, sort_keys=True))
             self.assertEqual(
                 final_text(raw),
-                "CODEAGENT_TOOL_OK",
+                "THESEUS_TOOL_OK",
                 msg=json.dumps(raw, indent=2, sort_keys=True),
             )
 

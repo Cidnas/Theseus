@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from codeagent import CodexAppServer, final_text, register_tools
+from theseus import CodexAppServer, final_text, register_tools
 
 
 FAKE_SERVER = Path(__file__).with_name("fake_app_server.py")
