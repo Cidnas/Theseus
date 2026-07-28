@@ -89,12 +89,49 @@ registered tool names selected when it is created or resumed.
 disk. Dynamic tools live in the embedding Python process and must be registered
 again after that process restarts.
 
+## External integrations
+
+New agents do not inherit external integrations by default. Theseus disables
+account apps/connectors, plugins, tool suggestions, and configured MCP servers
+for each new or resumed thread unless the application explicitly opts in.
+
+To retain the integrations available through the effective Codex configuration:
+
+```python
+thread_id = client.create_agent(inherit_integrations=True)
+```
+
+To expose only application-selected integrations, pass a Codex configuration
+fragment using the `apps`, `mcp_servers`, `plugins`, or `tool_suggest` sections:
+
+```python
+thread_id = client.create_agent(
+    integration_config={
+        "apps": {
+            "notion": {"enabled": True},
+        },
+        "mcp_servers": {
+            "project_docs": {
+                "url": "https://docs.example.com/mcp",
+                "enabled": True,
+            },
+        },
+    }
+)
+```
+
+When inheritance is disabled, the `apps._default.enabled = false` policy remains
+in place, so an app must be named explicitly. Supplying an `apps`, `plugins`, or
+`tool_suggest` section enables the corresponding Codex feature automatically.
+An app still needs its normal authorization; configuration does not perform an
+OAuth or installation flow.
+
 ## Threads and turns
 
 `create_agent()` returns a Codex thread ID. Applications are responsible for
-persisting that ID together with the names of the tools and skills assigned to
-it. After a process restart, rebuild the tool catalog and call
-`resume_agent()` before the next turn.
+persisting that ID together with the names of the tools, skills, and integration
+policy assigned to it. After a process restart, rebuild the tool catalog and
+call `resume_agent()` with those selections before the next turn.
 
 `run()` returns the raw app-server messages collected through
 `turn/completed`. It also supports:

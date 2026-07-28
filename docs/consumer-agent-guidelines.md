@@ -35,7 +35,8 @@ https://github.com/Cidnas/Theseus, checked out as the Git submodule
   inspect it unnecessarily, place its contents in tests, or delete it without
   explicit owner approval.
 - Persist thread IDs and their selected tool and skill names in the
-  application's own storage when conversations must survive restarts.
+  application's own storage when conversations must survive restarts. Persist
+  the integration inheritance flag and integration configuration as well.
 - After a process restart, rebuild the in-memory tool catalog and explicitly
   resume saved threads with their capabilities.
 - Do not start two simultaneous runs on the same thread. Use separate threads

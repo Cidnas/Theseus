@@ -86,6 +86,94 @@ class CodexAppServerTests(unittest.TestCase):
             self.assertEqual(payload["threadParams"]["threadId"], "existing-thread")
             self.assertEqual(payload["threadParams"]["dynamicTools"], [])
 
+    def test_agent_integrations_are_isolated_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.make_client(Path(directory)) as client:
+                thread_id = client.create_agent()
+                raw = client.run("Inspect configuration.", thread_id)
+
+        config = json.loads(final_text(raw) or "{}")["threadParams"]["config"]
+        self.assertEqual(
+            config["features"],
+            {"apps": False, "plugins": False, "tool_suggest": False},
+        )
+        self.assertEqual(config["apps"], {"_default": {"enabled": False}})
+        self.assertEqual(config["mcp_servers"], {})
+        self.assertEqual(config["plugins"], {})
+
+    def test_agent_can_inherit_integrations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.make_client(Path(directory)) as client:
+                thread_id = client.create_agent(inherit_integrations=True)
+                raw = client.run("Inspect configuration.", thread_id)
+
+        config = json.loads(final_text(raw) or "{}")["threadParams"]["config"]
+        self.assertNotIn("features", config)
+        self.assertNotIn("apps", config)
+        self.assertNotIn("mcp_servers", config)
+        self.assertNotIn("plugins", config)
+
+    def test_agent_can_use_only_explicit_integrations(self) -> None:
+        integrations = {
+            "apps": {"notion": {"enabled": True}},
+            "mcp_servers": {
+                "project_docs": {
+                    "url": "https://docs.example.test/mcp",
+                    "enabled": True,
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            with self.make_client(Path(directory)) as client:
+                thread_id = client.create_agent(integration_config=integrations)
+                raw = client.run("Inspect configuration.", thread_id)
+
+        config = json.loads(final_text(raw) or "{}")["threadParams"]["config"]
+        self.assertEqual(
+            config["features"],
+            {"apps": True, "plugins": False, "tool_suggest": False},
+        )
+        self.assertEqual(
+            config["apps"],
+            {
+                "_default": {"enabled": False},
+                "notion": {"enabled": True},
+            },
+        )
+        self.assertEqual(config["mcp_servers"], integrations["mcp_servers"])
+        self.assertEqual(config["plugins"], {})
+
+    def test_resume_agent_reattaches_integration_policy(self) -> None:
+        integrations = {
+            "mcp_servers": {
+                "project_docs": {"url": "https://docs.example.test/mcp"}
+            }
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            first = self.make_client(project)
+            thread_id = first.create_agent(inherit_integrations=True)
+            first.close()
+
+            second = self.make_client(project)
+            second.resume_agent(thread_id, integration_config=integrations)
+            try:
+                raw = second.run("Inspect restored configuration.", thread_id)
+            finally:
+                second.close()
+
+        config = json.loads(final_text(raw) or "{}")["threadParams"]["config"]
+        self.assertEqual(config["mcp_servers"], integrations["mcp_servers"])
+        self.assertEqual(config["features"]["apps"], False)
+
+    def test_agent_rejects_non_integration_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.make_client(Path(directory)) as client:
+                with self.assertRaisesRegex(ValueError, "unsupported integration"):
+                    client.create_agent(
+                        integration_config={"sandbox_mode": "danger-full-access"}
+                    )
+
     def test_run_passes_structured_output_and_application_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
