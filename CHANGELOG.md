@@ -5,6 +5,13 @@ versioning policy in [RELEASING.md](RELEASING.md).
 
 ## Unreleased
 
+## 0.2.0 - 2026-07-28
+
+### Added
+
+- Added per-agent integration controls through `inherit_integrations` and
+  `integration_config` on thread creation and resumption.
+
 ### Changed
 
 - Renamed the project, Python distribution, and import package from
@@ -12,6 +19,8 @@ versioning policy in [RELEASING.md](RELEASING.md).
 - Changed the default private runtime-state directory from `.codex-agent/` to
   `.theseus/`. Existing consumers should move the directory before starting
   Theseus to preserve authentication and thread history.
+- New and resumed agents now disable account apps/connectors, plugins, tool
+  suggestions, and configured MCP servers unless explicitly enabled.
 
 ## 0.1.0 - 2026-07-26
 

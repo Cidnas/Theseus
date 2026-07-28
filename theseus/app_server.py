@@ -8,6 +8,7 @@ tool callbacks remain internal to the module.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import queue
@@ -74,6 +75,12 @@ class _Tool:
 class _Agent:
     tools: tuple[str, ...]
     skills: tuple[str, ...]
+    integration_config: JsonObject
+
+
+_INTEGRATION_CONFIG_KEYS = frozenset(
+    {"apps", "mcp_servers", "plugins", "tool_suggest"}
+)
 
 
 class CodexAppServer:
@@ -230,13 +237,25 @@ class CodexAppServer:
         sandbox: str = "workspace-write",
         approval_policy: str = "never",
         developer_instructions: str | None = None,
+        inherit_integrations: bool = False,
+        integration_config: Mapping[str, Any] | None = None,
     ) -> str:
-        """Create a thread with exactly the requested registered capabilities."""
+        """Create a thread with only explicitly selected external integrations.
+
+        Account apps, plugins, tool suggestions, and configured MCP servers are
+        disabled by default. Set ``inherit_integrations`` to retain Codex's
+        configured integrations, or supply an ``integration_config`` fragment
+        containing only ``apps``, ``mcp_servers``, ``plugins``, or
+        ``tool_suggest`` sections.
+        """
 
         self.start()
         with self._state_lock:
             tool_names = _unique_names(tools, self._tools, "tool")
             skill_names = _unique_names(skills, self._skills, "skill")
+            integrations = _prepare_integration_config(
+                inherit_integrations, integration_config
+            )
             if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
                 raise ValueError(f"unsupported sandbox mode: {sandbox}")
             if approval_policy not in {"untrusted", "on-request", "never"}:
@@ -246,7 +265,7 @@ class CodexAppServer:
                 "sandbox": sandbox,
                 "approvalPolicy": approval_policy,
                 "dynamicTools": [self._tools[name].protocol_spec() for name in tool_names],
-                "config": self._skill_config(skill_names),
+                "config": self._agent_config(skill_names, integrations),
             }
             if model is not None:
                 params["model"] = model
@@ -258,7 +277,7 @@ class CodexAppServer:
         if thread_id is None:
             raise CodexProtocolError("thread/start response did not contain thread.id")
         with self._state_lock:
-            self._agents[thread_id] = _Agent(tool_names, skill_names)
+            self._agents[thread_id] = _Agent(tool_names, skill_names, integrations)
             self._loaded_threads.add(thread_id)
         return thread_id
 
@@ -268,6 +287,8 @@ class CodexAppServer:
         *,
         tools: Sequence[str] = (),
         skills: Sequence[str] = (),
+        inherit_integrations: bool = False,
+        integration_config: Mapping[str, Any] | None = None,
     ) -> str:
         """Restore a persisted thread with its registered capabilities.
 
@@ -275,6 +296,7 @@ class CodexAppServer:
         rebuild the tool catalog and explicitly reattach the thread's selections
         after a process restart.  The actual ``thread/resume`` request is deferred
         until :meth:`run`, matching the lazy behavior used for unknown thread IDs.
+        Integration selections must be reattached in the same way.
         """
 
         if not thread_id.strip():
@@ -282,11 +304,14 @@ class CodexAppServer:
         with self._state_lock:
             tool_names = _unique_names(tools, self._tools, "tool")
             skill_names = _unique_names(skills, self._skills, "skill")
+            integrations = _prepare_integration_config(
+                inherit_integrations, integration_config
+            )
             if thread_id in self._active_threads:
                 raise CodexAppServerError(
                     f"thread already has an active run: {thread_id}"
                 )
-            self._agents[thread_id] = _Agent(tool_names, skill_names)
+            self._agents[thread_id] = _Agent(tool_names, skill_names, integrations)
             self._loaded_threads.discard(thread_id)
         return thread_id
 
@@ -333,7 +358,10 @@ class CodexAppServer:
                     f"thread already has an active run: {thread_id}"
                 )
             self._active_threads.add(thread_id)
-            agent = self._agents.setdefault(thread_id, _Agent((), ()))
+            agent = self._agents.setdefault(
+                thread_id,
+                _Agent((), (), _prepare_integration_config(False, None)),
+            )
             should_resume = thread_id not in self._loaded_threads
             resume_params = {
                 "threadId": thread_id,
@@ -342,7 +370,9 @@ class CodexAppServer:
                     for name in agent.tools
                     if name in self._tools
                 ],
-                "config": self._skill_config(agent.skills),
+                "config": self._agent_config(
+                    agent.skills, agent.integration_config
+                ),
             }
 
         inbox: queue.Queue[JsonObject | BaseException | object] = queue.Queue()
@@ -620,6 +650,11 @@ class CodexAppServer:
             }
         }
 
+    def _agent_config(
+        self, selected_skills: tuple[str, ...], integrations: JsonObject
+    ) -> JsonObject:
+        return _merge_config(integrations, self._skill_config(selected_skills))
+
     def _send(self, message: JsonObject) -> None:
         process = self._process
         if process is None or process.stdin is None or process.poll() is not None:
@@ -768,6 +803,67 @@ def _resolve_cwd(
     result = result.resolve()
     if not result.is_dir():
         raise ValueError(f"working directory does not exist: {result}")
+    return result
+
+
+def _prepare_integration_config(
+    inherit_integrations: bool,
+    integration_config: Mapping[str, Any] | None,
+) -> JsonObject:
+    if not isinstance(inherit_integrations, bool):
+        raise TypeError("inherit_integrations must be a boolean")
+
+    requested = (
+        {}
+        if integration_config is None
+        else validate_json_object(integration_config, label="integration_config")
+    )
+    unsupported = sorted(set(requested) - _INTEGRATION_CONFIG_KEYS)
+    if unsupported:
+        raise ValueError(
+            f"unsupported integration config section(s): {', '.join(unsupported)}"
+        )
+    for name, section in requested.items():
+        if not isinstance(section, Mapping):
+            raise TypeError(f"integration_config[{name!r}] must be an object")
+
+    if inherit_integrations:
+        result: JsonObject = {}
+    else:
+        result = {
+            "features": {
+                "apps": False,
+                "plugins": False,
+                "tool_suggest": False,
+            },
+            "apps": {"_default": {"enabled": False}},
+            "mcp_servers": {},
+            "plugins": {},
+        }
+
+    result = _merge_config(result, requested)
+    features = result.setdefault("features", {})
+    assert isinstance(features, dict)
+    for section, feature in (
+        ("apps", "apps"),
+        ("plugins", "plugins"),
+        ("tool_suggest", "tool_suggest"),
+    ):
+        if requested.get(section):
+            features[feature] = True
+    if not features:
+        result.pop("features")
+    return result
+
+
+def _merge_config(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> JsonObject:
+    result = copy.deepcopy(dict(base))
+    for key, value in overlay.items():
+        existing = result.get(key)
+        if isinstance(existing, Mapping) and isinstance(value, Mapping):
+            result[key] = _merge_config(existing, value)
+        else:
+            result[key] = copy.deepcopy(value)
     return result
 
 
