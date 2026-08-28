@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import os
 import queue
@@ -183,6 +184,8 @@ class CodexAppServer:
             raise ValueError("tool description cannot be empty")
         if not callable(handler):
             raise TypeError("tool handler must be callable")
+        if inspect.iscoroutinefunction(handler):
+            raise TypeError("async tool handlers are not supported")
         schema = validate_json_object(input_schema, label="input_schema")
         with self._state_lock:
             self._tools[name] = _Tool(

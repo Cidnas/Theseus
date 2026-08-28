@@ -84,6 +84,7 @@ Tools can be registered directly with `add_tool()`. `register_tools()` provides
 a smaller adapter for ordinary synchronous Python functions whose parameters
 use `str`, `int`, `float`, or `bool` annotations. A thread receives only the
 registered tool names selected when it is created or resumed.
+Handlers passed directly to `add_tool()` must also be synchronous.
 
 `add_skill()` installs a skill under the isolated Codex home. Skills persist on
 disk. Dynamic tools live in the embedding Python process and must be registered

@@ -5,6 +5,11 @@ versioning policy in [RELEASING.md](RELEASING.md).
 
 ## Unreleased
 
+### Fixed
+
+- `add_tool()` now rejects async handlers at registration time instead of
+  accepting a coroutine that the dynamic-tool runtime cannot await.
+
 ## 0.2.0 - 2026-07-28
 
 ### Added

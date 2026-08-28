@@ -22,6 +22,20 @@ class CodexAppServerTests(unittest.TestCase):
             timeout=5,
         )
 
+    def test_add_tool_rejects_async_handler(self) -> None:
+        async def async_handler(arguments: dict[str, object]) -> object:
+            return arguments
+
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(Path(directory))
+            with self.assertRaisesRegex(TypeError, "async tool handlers"):
+                client.add_tool(
+                    "async_tool",
+                    "Unsupported asynchronous tool.",
+                    {"type": "object", "properties": {}},
+                    async_handler,
+                )
+
     def test_run_returns_raw_messages_and_routes_registered_tool(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
