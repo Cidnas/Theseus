@@ -14,4 +14,6 @@ app-server in applications.
 - Deterministic protocol tests, opt-in live integration tests, and a local
   transport benchmark.
 
+- Usage-focused documentation with examples for tools and concurrent agents.
+
 See [RELEASING.md](RELEASING.md) for the release process.
