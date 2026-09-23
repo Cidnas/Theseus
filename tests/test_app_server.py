@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 import tempfile
@@ -68,21 +67,17 @@ class CodexAppServerTests(unittest.TestCase):
             self.assertIn({"path": str(unselected), "enabled": False}, skill_config)
             self.assertEqual(
                 payload["toolResponse"]["result"],
-                {"contentItems": [{"type": "inputText", "text": "14"}], "success": True},
+                {
+                    "contentItems": [{"type": "inputText", "text": "14"}],
+                    "success": True,
+                },
             )
             self.assertEqual(
-                (project / ".theseus/skills/selected-skill/references/example.txt").read_text(),
+                (
+                    project / ".theseus/skills/selected-skill/references/example.txt"
+                ).read_text(),
                 "example",
             )
-
-    def test_unknown_thread_is_resumed_before_turn(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
-            with self.make_client(project) as client:
-                raw = client.run("Continue.", "existing-thread")
-            payload = json.loads(final_text(raw) or "{}")
-            self.assertEqual(payload["threadParams"]["threadId"], "existing-thread")
-            self.assertEqual(payload["threadParams"]["dynamicTools"], [])
 
     def test_agent_integrations_are_isolated_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -140,29 +135,6 @@ class CodexAppServerTests(unittest.TestCase):
         )
         self.assertEqual(config["mcp_servers"], integrations["mcp_servers"])
         self.assertEqual(config["plugins"], {})
-
-    def test_resume_agent_reattaches_integration_policy(self) -> None:
-        integrations = {
-            "mcp_servers": {
-                "project_docs": {"url": "https://docs.example.test/mcp"}
-            }
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
-            first = self.make_client(project)
-            thread_id = first.create_agent(inherit_integrations=True)
-            first.close()
-
-            second = self.make_client(project)
-            second.resume_agent(thread_id, integration_config=integrations)
-            try:
-                raw = second.run("Inspect restored configuration.", thread_id)
-            finally:
-                second.close()
-
-        config = json.loads(final_text(raw) or "{}")["threadParams"]["config"]
-        self.assertEqual(config["mcp_servers"], integrations["mcp_servers"])
-        self.assertEqual(config["features"]["apps"], False)
 
     def test_agent_rejects_non_integration_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -236,20 +208,7 @@ class CodexAppServerTests(unittest.TestCase):
                 payload["toolResponse"]["result"]["contentItems"][0]["text"],
             )
 
-    def test_agent_can_resume_after_client_restart(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
-            client = self.make_client(project)
-            thread_id = client.create_agent()
-            client.close()
-            try:
-                raw = client.run("Continue after restart.", thread_id)
-            finally:
-                client.close()
-            payload = json.loads(final_text(raw) or "{}")
-            self.assertEqual(payload["threadParams"]["threadId"], thread_id)
-
-    def test_resume_agent_reattaches_tools_after_client_restart(self) -> None:
+    def test_resume_reattaches_tools_and_integration_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             first = self.make_client(project)
@@ -259,7 +218,7 @@ class CodexAppServerTests(unittest.TestCase):
                 {"type": "object", "properties": {"value": {"type": "integer"}}},
                 lambda arguments: arguments["value"] * 2,
             )
-            thread_id = first.create_agent(tools=["double"])
+            thread_id = first.create_agent(tools=["double"], inherit_integrations=True)
             first.close()
 
             calls: list[dict[str, object]] = []
@@ -270,7 +229,12 @@ class CodexAppServerTests(unittest.TestCase):
                 {"type": "object", "properties": {"value": {"type": "integer"}}},
                 lambda arguments: calls.append(arguments) or arguments["value"] * 2,
             )
-            second.resume_agent(thread_id, tools=["double"])
+            integrations = {
+                "mcp_servers": {"docs": {"url": "https://example.test/mcp"}}
+            }
+            second.resume_agent(
+                thread_id, tools=["double"], integration_config=integrations
+            )
             try:
                 raw = second.run("Use the restored tool.", thread_id)
             finally:
@@ -279,46 +243,11 @@ class CodexAppServerTests(unittest.TestCase):
             payload = json.loads(final_text(raw) or "{}")
             self.assertEqual(calls, [{"value": 7}])
             self.assertEqual(
-                payload["threadParams"]["dynamicTools"][0]["name"], "double"
+                payload["toolResponse"]["result"]["contentItems"][0]["text"], "14"
             )
-
-    def test_resume_agent_rejects_unknown_capabilities(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            with self.make_client(Path(directory)) as client:
-                with self.assertRaisesRegex(KeyError, "unknown tool"):
-                    client.resume_agent("thread-1", tools=["missing"])
-
-    def test_different_agents_can_run_in_parallel_without_mixing_messages(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory)
-
-            async def run_agents() -> tuple[
-                str,
-                str,
-                list[dict[str, object]],
-                list[dict[str, object]],
-            ]:
-                async with self.make_client(project) as client:
-                    thread_a = client.create_agent()
-                    thread_b = client.create_agent()
-                    messages_a, messages_b = await asyncio.gather(
-                        client.run_async("Parallel A", thread_a),
-                        client.run_async("Parallel B", thread_b),
-                    )
-                    return thread_a, thread_b, messages_a, messages_b
-
-            thread_a, thread_b, messages_a, messages_b = asyncio.run(run_agents())
-
-            self.assertEqual(final_text(messages_a), "Parallel A")
-            self.assertEqual(final_text(messages_b), "Parallel B")
-            for thread_id, messages in (
-                (thread_a, messages_a),
-                (thread_b, messages_b),
-            ):
-                for message in messages:
-                    params = message.get("params")
-                    if isinstance(params, dict) and "threadId" in params:
-                        self.assertEqual(params["threadId"], thread_id)
+            config = payload["threadParams"]["config"]
+            self.assertEqual(config["mcp_servers"], integrations["mcp_servers"])
+            self.assertFalse(config["features"]["apps"])
 
     def test_skill_resource_cannot_escape_skill_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -332,12 +261,17 @@ class CodexAppServerTests(unittest.TestCase):
                     resources={"../outside.txt": "no"},
                 )
 
-    def test_unknown_capability_is_rejected_before_starting_thread(self) -> None:
+    def test_unknown_capability_is_rejected_on_create_and_resume(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
             with self.make_client(project) as client:
-                with self.assertRaisesRegex(KeyError, "unknown tool"):
-                    client.create_agent(tools=["missing"])
+                for operation in (
+                    client.create_agent,
+                    lambda **kw: client.resume_agent("thread-1", **kw),
+                ):
+                    with self.subTest(operation=operation.__name__):
+                        with self.assertRaisesRegex(KeyError, "unknown tool"):
+                            operation(tools=["missing"])
 
 
 if __name__ == "__main__":

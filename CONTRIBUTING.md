@@ -14,6 +14,9 @@ For fixes, add a regression test that demonstrates the failure, then make the
 change. Test public behavior; use temporary state and fake protocol data.
 Update the relevant docs and `CHANGELOG.md` when behavior changes.
 
+Keep one test per distinct behavior or failure mode. Extend an existing scenario
+when it already exercises the same path; avoid duplicate smoke checks.
+
 The default suite makes no model calls. To run the live checks explicitly:
 
 ```bash

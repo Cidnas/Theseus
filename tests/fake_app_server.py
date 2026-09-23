@@ -89,7 +89,27 @@ for line in sys.stdin:
     if method is None:
         run = pending_tools.pop(request_id, None)
         if run and active.get(run["thread"]) is run:
-            complete(run, payload(run, request))
+            if "toolCalls" in run:
+                call_id, name = run["toolCalls"][request_id]
+                run["toolResponses"][call_id] = request["result"]
+                send(
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": run["thread"],
+                            "turnId": run["turn"],
+                            "item": {
+                                "id": call_id,
+                                "type": "dynamicToolCall",
+                                "tool": name,
+                            },
+                        },
+                    }
+                )
+                if len(run["toolResponses"]) == len(run["toolCalls"]):
+                    complete(run, json.dumps(run["toolResponses"]))
+            else:
+                complete(run, payload(run, request))
     elif method == "initialize":
         send({"id": request_id, "result": {"userAgent": "fake"}})
     elif method == "initialized":
@@ -109,10 +129,10 @@ for line in sys.stdin:
                 }
             )
             continue
-        if thread.startswith("missing-rollout-"):
+        if thread not in threads:
             send({"id": request_id, "error": {"code": -32600, "message": "no rollout"}})
         else:
-            threads[thread] = {**threads.get(thread, {"dynamicTools": []}), **params}
+            threads[thread] = {**threads[thread], **params}
             send({"id": request_id, "result": {"thread": {"id": thread}}})
     elif method == "model/list":
         number = 2 if params.get("cursor") else 1
@@ -244,6 +264,27 @@ for line in sys.stdin:
             complete(run, "hello world")
             continue
         tools = threads[thread].get("dynamicTools", [])
+        if prompt == "Concurrent tools.":
+            run["toolCalls"], run["toolResponses"] = {}, {}
+            for value, tool in enumerate(tools, start=1):
+                call_id = f"call-{value}"
+                request_id = f"request-{value}-{run['turn']}"
+                run["toolCalls"][request_id] = (call_id, tool["name"])
+                pending_tools[request_id] = run
+                send(
+                    {
+                        "id": request_id,
+                        "method": "item/tool/call",
+                        "params": {
+                            "threadId": thread,
+                            "turnId": run["turn"],
+                            "callId": call_id,
+                            "tool": tool["name"],
+                            "arguments": {"value": value},
+                        },
+                    }
+                )
+            continue
         name = (
             "unavailable"
             if prompt == "Request an unavailable tool."

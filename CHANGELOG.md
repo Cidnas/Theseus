@@ -15,5 +15,7 @@ app-server in applications.
   transport benchmark.
 
 - Usage-focused documentation with examples for tools and concurrent agents.
+- Consolidated overlapping tests and added a regression for concurrent tools
+  within one turn, including async handlers and out-of-order result routing.
 
 See [RELEASING.md](RELEASING.md) for the release process.

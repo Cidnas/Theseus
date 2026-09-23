@@ -80,28 +80,31 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(events[-1].result.text, "hello world")
         self.assertEqual(sum(event.kind == "completed" for event in events), 1)
 
-    def test_async_stream_and_native_async_tool(self):
-        async def double(value: int):
-            """Double a value asynchronously."""
-            await asyncio.sleep(0)
-            return value * 2
-
+    def test_async_stream_has_deltas_and_one_final_result(self):
         async def scenario():
-            plain = await self.client.agent_async()
-            async with aclosing(plain.stream_async("Stream deltas.")) as stream:
+            agent = await self.client.agent_async()
+            async with aclosing(agent.stream_async("Stream deltas.")) as stream:
                 events = [event async for event in stream]
-            self.assertEqual(events[-1].result.text, "hello world")
-            tools = register_tools(self.client, [double])
-            worker = await self.client.agent_async(tools=tools)
-            result = await worker.run_async("Use tool.")
             self.assertEqual(
-                json.loads(result.text)["toolResponse"]["result"]["contentItems"][0][
-                    "text"
-                ],
-                "14",
+                "".join(e.text for e in events if e.kind == "text_delta"), "hello world"
             )
+            self.assertEqual(events[-1].result.text, "hello world")
+            self.assertEqual(sum(e.kind == "completed" for e in events), 1)
 
         asyncio.run(scenario())
+
+    def test_tool_function_requires_documentation_and_parameter_types(self):
+        def undocumented(value: int) -> int:
+            return value
+
+        def untyped(value):
+            """Return the value."""
+            return value
+
+        with self.assertRaisesRegex(ValueError, "requires a docstring"):
+            register_tools(self.client, [undocumented])
+        with self.assertRaisesRegex(TypeError, "requires a type annotation"):
+            register_tools(self.client, [untyped])
 
     def test_structured_function_inputs(self):
         calls = []
@@ -118,7 +121,9 @@ class AgentTests(unittest.TestCase):
 
         names = register_tools(self.client, [combine])
         result = self.client.agent(tools=names).run("Structured tool arguments.")
-        self.assertTrue(json.loads(result.text)["toolResponse"]["result"]["success"])
+        output = json.loads(result.text)["toolResponse"]["result"]
+        self.assertTrue(output["success"])
+        self.assertEqual(output["contentItems"][0]["text"], "3")
         self.assertEqual(calls, [([1, 2], "sum", {"tag": "test"}, None)])
 
     def test_invalid_arguments_never_reach_function(self):
@@ -160,11 +165,17 @@ class AgentTests(unittest.TestCase):
             a = await self.client.agent_async()
             b = await self.client.agent_async()
             results = await run_parallel(
-                [(a, "Parallel A"), (b, "Parallel B")], limit=2
+                [(a, "Parallel A"), (b, "Parallel B")], limit=2, include_raw=True
             )
             self.assertEqual(
                 [result.text for result in results], ["Parallel A", "Parallel B"]
             )
+            for agent, result in zip((a, b), results):
+                self.assertEqual(result.thread_id, agent.id)
+                for message in result.raw_events:
+                    params = message.get("params", {})
+                    if "threadId" in params:
+                        self.assertEqual(params["threadId"], agent.id)
             with self.assertRaises(ValueError):
                 await run_parallel([(a, "One"), (a, "Two")])
 
@@ -186,25 +197,96 @@ class AgentTests(unittest.TestCase):
             "completed",
         )
 
-    def test_task_cancellation_interrupts_server_and_allows_next_turn(self):
+    def test_same_turn_tools_overlap_and_correlate_out_of_order_results(self):
+        # Covers both async registration paths (#5) and concurrent dispatch (#7).
         async def scenario():
-            agent = await self.client.agent_async()
-            started = threading.Event()
+            caller = asyncio.get_running_loop()
+            entered = set()
+            both_entered, second_returned = asyncio.Event(), asyncio.Event()
 
-            def event(message):
-                if message.get("method") == "turn/started":
-                    started.set()
+            async def handle(value):
+                self.assertIs(asyncio.get_running_loop(), caller)
+                entered.add(value)
+                if entered == {1, 2}:
+                    both_entered.set()
+                await asyncio.wait_for(both_entered.wait(), 2)
+                if value == 1:
+                    # Wait until the peer has received call 2's result. No sleeps
+                    # or timing assertions: serial dispatch cannot satisfy this.
+                    await asyncio.wait_for(second_returned.wait(), 2)
+                return value * 10
 
-            task = asyncio.create_task(agent.run_async("Hold turn.", on_event=event))
-            while not started.is_set():
-                await asyncio.sleep(0.001)
-            with self.assertRaises(CodexBusyError):
-                await agent.run_async("Another turn.")
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-            result = await agent.run_async("Inspect.")
-            self.assertEqual(len(json.loads(result.text)["interrupts"]), 1)
+            async def direct(arguments):
+                return await handle(arguments["value"])
+
+            async def adapted(value: int):
+                """Return a value after both handlers have entered."""
+                return await handle(value)
+
+            async def observe(message):
+                self.assertIs(asyncio.get_running_loop(), caller)
+                item = message.get("params", {}).get("item", {})
+                if (
+                    message.get("method") == "item/completed"
+                    and item.get("id") == "call-2"
+                ):
+                    second_returned.set()
+
+            self.client.add_tool(
+                "direct",
+                "Handle a call directly.",
+                {
+                    "type": "object",
+                    "properties": {"value": {"type": "integer"}},
+                    "required": ["value"],
+                },
+                direct,
+            )
+            names = register_tools(self.client, [adapted])
+            agent = await self.client.agent_async(tools=["direct", *names])
+            result = await agent.run_async("Concurrent tools.", on_event=observe)
+            responses = json.loads(result.text)
+            self.assertEqual(entered, {1, 2})
+            self.assertEqual(list(responses), ["call-2", "call-1"])
+            for value in (1, 2):
+                response = responses[f"call-{value}"]
+                self.assertTrue(response["success"])
+                self.assertEqual(response["contentItems"][0]["text"], str(value * 10))
+
+        asyncio.run(scenario())
+
+    def test_task_cancellation_stops_tool_and_allows_next_turn(self):
+        async def scenario():
+            entered, stopped = asyncio.Event(), asyncio.Event()
+
+            async def blocked(value: int):
+                """Wait for cancellation."""
+                entered.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+            agent = await self.client.agent_async(
+                tools=register_tools(self.client, [blocked])
+            )
+            task = asyncio.create_task(agent.run_async("Use tool."))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                with self.assertRaises(CodexBusyError):
+                    await agent.run_async("Another turn.")
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(stopped.is_set())
+                result = await agent.run_async("Stream deltas.")
+                self.assertEqual(result.status, "completed")
+                # The fake rejects a second turn if the first was not interrupted.
+                self.assertEqual(result.text, "hello world")
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
         asyncio.run(scenario())
 
@@ -365,31 +447,6 @@ class AgentTests(unittest.TestCase):
 
         asyncio.run(scenario())
 
-    def test_cancelled_async_tool_receives_cancellation(self):
-        entered, stopped = threading.Event(), threading.Event()
-
-        async def slow(value: int):
-            """Wait until the turn is cancelled."""
-            entered.set()
-            try:
-                await asyncio.sleep(10)
-            finally:
-                stopped.set()
-
-        async def scenario():
-            agent = await self.client.agent_async(
-                tools=register_tools(self.client, [slow])
-            )
-            task = asyncio.create_task(agent.run_async("Use tool."))
-            while not entered.is_set():
-                await asyncio.sleep(0.001)
-            task.cancel()
-            with self.assertRaises(asyncio.CancelledError):
-                await task
-            self.assertTrue(stopped.is_set())
-
-        asyncio.run(scenario())
-
     def test_failed_parallel_run_cancels_siblings(self):
         async def scenario():
             a, b = await self.client.agent_async(), await self.client.agent_async()
@@ -413,28 +470,6 @@ class AgentTests(unittest.TestCase):
         result = resumed.run("Use persisted tool.")
         self.assertFalse(json.loads(result.text)["toolResponse"]["result"]["success"])
         self.assertEqual(calls, [])
-
-    def test_async_tools_and_callbacks_use_callers_loop(self):
-        async def scenario():
-            caller = asyncio.get_running_loop()
-            observed = []
-
-            async def tool(value: int):
-                """Record the application event loop."""
-                observed.append(asyncio.get_running_loop())
-                return value
-
-            async def callback(message):
-                observed.append(asyncio.get_running_loop())
-
-            agent = await self.client.agent_async(
-                tools=register_tools(self.client, [tool])
-            )
-            await agent.run_async("Use tool.", on_event=callback)
-            self.assertTrue(observed)
-            self.assertTrue(all(loop is caller for loop in observed))
-
-        asyncio.run(scenario())
 
     def test_rejected_start_does_not_quarantine_idle_thread(self):
         agent = self.client.agent()
